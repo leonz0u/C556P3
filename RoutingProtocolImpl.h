@@ -3,6 +3,41 @@
 
 #include "RoutingProtocol.h"
 #include "Node.h"
+#include <vector>
+#include <map>
+#include <cstring>
+#include <arpa/inet.h>
+
+// 定时器类型定义
+enum AlarmType {
+    ALARM_PING = 0,           // 10秒一次的PING
+    ALARM_DV_UPDATE,          // 30秒一次的DV更新
+    ALARM_LS_UPDATE,          // 30秒一次的LS更新
+    ALARM_PERIODIC_CHECK      // 1秒一次的状态检查(合并邻居和路由检查)
+};
+
+// 端口状态结构
+struct PortStatus {
+    unsigned short neighbor_id;    // 邻居路由器ID，初始为INFINITY_COST
+    unsigned int last_ping_time;   // 上次发送PING的时间
+    unsigned int last_pong_time;   // 上次收到PONG的时间
+    bool is_alive;                 // 端口是否活跃
+    unsigned short cost;           // 链路成本(RTT)
+    
+    PortStatus() : neighbor_id(INFINITY_COST), last_ping_time(0), 
+                  last_pong_time(0), is_alive(false), cost(INFINITY_COST) {}
+};
+
+// DV表项结构
+struct DVEntry {
+    unsigned short next_hop;       // 下一跳路由器ID
+    unsigned short port;           // 出口端口
+    unsigned short cost;           // 到目的地的总成本
+    unsigned int last_updated;     // 最后更新时间
+    
+    DVEntry() : next_hop(INFINITY_COST), port(INFINITY_COST), 
+                cost(INFINITY_COST), last_updated(0) {}
+};
 
 class RoutingProtocolImpl : public RoutingProtocol {
   public:
@@ -37,7 +72,28 @@ class RoutingProtocolImpl : public RoutingProtocol {
     // a neighbor router.
 
  private:
-    Node *sys; // To store Node object; used to access GSR9999 interfaces 
+        Node *sys;                         // 系统接口
+        unsigned short router_id;          // 路由器ID
+        unsigned short num_ports;          // 端口数量
+        eProtocolType protocol_type;       // 协议类型
+        std::vector<PortStatus> ports;     // 端口状态表
+        std::map<unsigned short, DVEntry> dv_table;  // 距离向量表
+
+        // PING/PONG相关方法
+        void send_ping(unsigned short port);
+        void handle_ping(unsigned short port, void *packet, unsigned short size);
+        void handle_pong(unsigned short port, void *packet, unsigned short size);
+        void check_neighbors();
+
+        // DV协议相关方法
+        void send_dv_update(bool triggered = false);
+        void handle_dv_packet(unsigned short port, void *packet, unsigned short size);
+        bool update_dv_entry(unsigned short dest, unsigned short next_hop, 
+                            unsigned short port, unsigned short cost);
+        void check_dv_timeouts();
+        void forward_data_packet(unsigned short port, void *packet, unsigned short size);
+        void print_dv_table(); 
+        
 };
 
 #endif
