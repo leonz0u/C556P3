@@ -280,15 +280,21 @@ void RoutingProtocolImpl::check_neighbors() {
                     unsigned short failed_neighbor = ports[port].neighbor_id;
                     
                     // 更新DV表
+                    bool removed = false;
                     if (protocol_type == P_DV) {
                         // 移除通过该邻居的路由
                         auto it = dv_table.begin();
                         while (it != dv_table.end()) {
                             if (it->second.next_hop == failed_neighbor) {
                                 it = dv_table.erase(it);
+                                removed = true;
                             } else {
                                 ++it;
                             }
+                        }
+                        // print dv table if removed
+                        if (removed) {
+                            print_dv_table();
                         }
                     }
                     // 如果是 LS 协议，直接删除链路状态条目
@@ -987,6 +993,10 @@ bool RoutingProtocolImpl::update_dv_entry(unsigned short dest, unsigned short ne
             updated = true;
             DEBUG_PRINT("Router %d: Updating route to %d via %d with cost %d\n",
                        router_id, dest, next_hop, cost);
+        }
+        else {
+            // no need to update, only update the last_updated time
+            it->second.last_updated = current_time;
         }
     }
     
