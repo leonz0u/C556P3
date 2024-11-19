@@ -39,6 +39,21 @@ struct DVEntry {
                 cost(INFINITY_COST), last_updated(0) {}
 };
 
+// LS表项结构
+struct LSEntry {
+    unsigned short src;            // 源路由器ID
+    unsigned short dst;            // 目的地路由器ID
+    unsigned short cost;           // 链路成本
+    unsigned int seq_num;          // 序列号
+    unsigned int last_updated;     // 最后更新时间
+
+    LSEntry() : src(0), dst(0), cost(0), seq_num(0), last_updated(0) {}
+
+    LSEntry(unsigned short s, unsigned short d, unsigned short c, unsigned int seq, unsigned int last)
+        : src(s), dst(d), cost(c), seq_num(seq), last_updated(last) {}
+};
+typedef std::map<std::pair<unsigned short, unsigned short>, LSEntry> LSDatabase;
+
 class RoutingProtocolImpl : public RoutingProtocol {
   public:
     RoutingProtocolImpl(Node *n);
@@ -78,6 +93,7 @@ class RoutingProtocolImpl : public RoutingProtocol {
         eProtocolType protocol_type;       // 协议类型
         std::vector<PortStatus> ports;     // 端口状态表
         std::map<unsigned short, DVEntry> dv_table;  // 距离向量表
+        LSDatabase ls_database; // 链路状态数据库
 
         // PING/PONG相关方法
         void send_ping(unsigned short port);
@@ -93,6 +109,13 @@ class RoutingProtocolImpl : public RoutingProtocol {
         void check_dv_timeouts();
         void forward_data_packet(unsigned short port, void *packet, unsigned short size);
         void print_dv_table(); 
+
+        // LS协议相关方法
+        void send_ls_update(bool triggered = false);
+        void handle_ls_packet(unsigned short port, void *packet, unsigned short size);
+        void update_ls_database(const LSEntry &entry);
+        void compute_shortest_paths();
+        void check_ls_timeouts();
         
 };
 

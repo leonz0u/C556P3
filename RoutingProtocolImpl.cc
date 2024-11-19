@@ -1,6 +1,9 @@
 #include "RoutingProtocolImpl.h"
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
+#include <set>
+
 #define DEBUG 1
 #define DEBUG_PRINT(fmt, ...) \
     do { if (DEBUG) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
@@ -63,6 +66,13 @@ void RoutingProtocolImpl::init(unsigned short num_ports, unsigned short router_i
         // 设置后续的DV更新定时器
         alarm_data = new AlarmType(ALARM_DV_UPDATE);
         sys->set_alarm(this, 30000, (void *)alarm_data);
+    }  else if (protocol_type == P_LS) {
+        // 初始化LS协议：发送第一轮链路状态更新
+        send_ls_update(false);
+
+        // 设置周期性LS更新定时器 (30秒)
+        AlarmType *ls_update_alarm = new AlarmType(ALARM_LS_UPDATE);
+        sys->set_alarm(this, 30000, (void *)ls_update_alarm);
     }
 }
 
@@ -323,6 +333,16 @@ void RoutingProtocolImpl::handle_alarm(void *data) {
             }
             break;
         }
+
+        case ALARM_LS_UPDATE:
+            if (protocol_type == P_LS) {
+                DEBUG_PRINT("Router %d: Sending periodic LS update at time %u\n", 
+                           router_id, sys->time());
+                send_ls_update(false);
+                AlarmType *new_alarm = new AlarmType(ALARM_LS_UPDATE);
+                sys->set_alarm(this, 30000, (void *)new_alarm);
+            }
+            break;
         
         case ALARM_PERIODIC_CHECK: {
             // 执行所有周期性检查
@@ -330,6 +350,8 @@ void RoutingProtocolImpl::handle_alarm(void *data) {
             
             if (protocol_type == P_DV) {
                 check_dv_timeouts();  // 检查路由超时
+            } else if(protocol_type == P_LS){
+                check_ls_timeouts();
             }
             
             // 设置下一次周期性检查
@@ -374,6 +396,13 @@ void RoutingProtocolImpl::recv(unsigned short port, void *packet, unsigned short
         case DV:
             if (protocol_type == P_DV) {
                 handle_dv_packet(port, packet, size);
+            } else {
+                delete[] pkt;
+            }
+            break;
+        case LS:
+            if (protocol_type == P_LS) {
+                handle_ls_packet(port, packet, size);
             } else {
                 delete[] pkt;
             }
@@ -477,6 +506,74 @@ void RoutingProtocolImpl::send_dv_update(bool triggered) {
 }
 
 /**
+ * @brief 发送链路状态更新
+ * 
+ * 向所有活跃端口的邻居发送当前的链路状态信息。
+ * 实现洪泛机制，包含所有链路状态条目。
+ * 
+ * @param triggered 是否为触发更新，true表示立即更新，false表示周期性更新, 调试输出使用
+ */
+void RoutingProtocolImpl::send_ls_update(bool triggered) {
+    DEBUG_PRINT("Router %d: Preparing LS update at time %u (triggered=%d)\n",
+                router_id, sys->time(), triggered);
+
+    // 基本LS包头: type(1) + reserved(1) + size(2) + src_id(2)
+    unsigned short base_size = 8;
+    // 每个LS表项: src_id(2) + dst_id(2) + cost(2) + seq_num(4)
+    unsigned short entry_size = 10;
+
+    // 遍历所有端口
+    for (unsigned short port = 0; port < num_ports; port++) {
+        // 检查端口是否活跃
+        if (!ports[port].is_alive) {
+            continue;  // 跳过非活跃端口
+        }
+
+        // 收集要发送的链路状态表项
+        std::vector<LSEntry> entries;
+
+        for (const auto &entry : ls_database) {
+            entries.push_back(entry.second);
+        }
+
+        // 即使没有表项也发送更新（空包）
+        unsigned short packet_size = base_size + entry_size * entries.size();
+        char *packet = new char[packet_size];
+        memset(packet, 0, packet_size);  // 清零整个包
+
+        // 设置包头
+        packet[0] = LS;  // 包类型
+        packet[1] = 0;   // 保留字段
+        unsigned short size_n = htons(packet_size);
+        memcpy(packet + 2, &size_n, 2);
+        unsigned short src_n = htons(router_id);
+        memcpy(packet + 4, &src_n, 2);
+
+        // 添加LS表项
+        int offset = base_size;
+        for (const auto &entry : entries) {
+            unsigned short src = htons(entry.src);
+            unsigned short dst = htons(entry.dst);
+            unsigned short cost = htons(entry.cost);
+            unsigned int seq_num = htonl(entry.seq_num);
+
+            memcpy(packet + offset, &src, 2);
+            memcpy(packet + offset + 2, &dst, 2);
+            memcpy(packet + offset + 4, &cost, 2);
+            memcpy(packet + offset + 6, &seq_num, 4);
+
+            offset += entry_size;
+        }
+
+        DEBUG_PRINT("Router %d: Sending LS update to port %d with %zu entries\n",
+                    router_id, port, entries.size());
+
+        sys->send(port, packet, packet_size);
+        // 注意：不要在这里删除packet，因为send()函数会接管内存
+    }
+}
+
+/**
  * @brief 处理接收到的DV更新包
  * 
  * 处理邻居发送的距离向量更新信息，更新本地路由表。
@@ -567,6 +664,110 @@ void RoutingProtocolImpl::handle_dv_packet(unsigned short port, void *packet, un
     delete[] pkt;
 }
 
+/**
+ * @brief 处理接收到的LS更新包
+ * 
+ * 处理邻居发送的链路状态更新信息，更新本地链路状态数据库。
+ * 如果链路状态发生变化，可能触发新的最短路径计算。
+ * 
+ * @param port 接收更新的端口号
+ * @param packet LS更新包指针
+ * @param size 数据包大小
+ */
+void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, unsigned short size) {
+    char *pkt = (char *)packet;
+    unsigned short src_id;
+    memcpy(&src_id, pkt + 4, 2);
+    src_id = ntohs(src_id);
+
+    DEBUG_PRINT("Router %d: Received LS update from Router %d on port %d\n", 
+                router_id, src_id, port);
+
+    // 确保这是从正确的邻居收到的更新
+    if (ports[port].neighbor_id != src_id) {
+        DEBUG_PRINT("Router %d: Ignoring LS update from unexpected neighbor %d on port %d\n",
+                   router_id, src_id, port);
+        delete[] pkt;
+        return;
+    }
+
+    bool updated = false;
+    unsigned int current_time = sys->time();
+
+    // 从包中提取LS表项
+    int offset = 8;
+    while (offset < size) {
+        unsigned short link_src, link_dst, link_cost;
+        unsigned int seq_num;
+
+        memcpy(&link_src, pkt + offset, 2);
+        memcpy(&link_dst, pkt + offset + 2, 2);
+        memcpy(&link_cost, pkt + offset + 4, 2);
+        memcpy(&seq_num, pkt + offset + 6, 4);
+
+        link_src = ntohs(link_src);
+        link_dst = ntohs(link_dst);
+        link_cost = ntohs(link_cost);
+        seq_num = ntohl(seq_num);
+
+        // 检查是否需要更新链路状态数据库
+        auto link_key = std::make_pair(link_src, link_dst);
+        if (ls_database.find(link_key) == ls_database.end() || 
+            ls_database[link_key].seq_num < seq_num) {
+            // 更新链路状态条目
+            ls_database[link_key] = {link_src, link_dst, link_cost, seq_num, current_time};
+            updated = true;
+
+            DEBUG_PRINT("Router %d: Updated link state (%d -> %d) with cost %d and seq_num %u\n",
+                        router_id, link_src, link_dst, link_cost, seq_num);
+        }
+
+        offset += 10; // 每个表项大小为 10 字节
+    }
+
+    // 如果发生更新，重新计算最短路径
+    if (updated) {
+        DEBUG_PRINT("Router %d: Triggering shortest path computation due to LS update\n", router_id);
+        compute_shortest_paths();
+    }
+
+    delete[] pkt;
+}
+
+
+void RoutingProtocolImpl::compute_shortest_paths() {
+    std::map<unsigned short, unsigned short> dist;
+    std::map<unsigned short, unsigned short> prev;
+    std::set<unsigned short> visited;
+
+    dist[router_id] = 0;
+
+    while (visited.size() < ls_database.size()) {
+        unsigned short min_node = 0;
+        unsigned short min_dist = USHRT_MAX;
+
+        for (auto &entry : dist) {
+            if (visited.find(entry.first) == visited.end() && entry.second < min_dist) {
+                min_node = entry.first;
+                min_dist = entry.second;
+            }
+        }
+
+        visited.insert(min_node);
+
+        for (auto &entry : ls_database) {
+            if (entry.second.src == min_node) {
+                unsigned short neighbor = entry.second.dst;
+                unsigned short new_cost = dist[min_node] + entry.second.cost;
+
+                if (dist.find(neighbor) == dist.end() || new_cost < dist[neighbor]) {
+                    dist[neighbor] = new_cost;
+                    prev[neighbor] = min_node;
+                }
+            }
+        }
+    }
+}
 
 void RoutingProtocolImpl::check_dv_timeouts() {
     unsigned int current_time = sys->time();
@@ -589,6 +790,17 @@ void RoutingProtocolImpl::check_dv_timeouts() {
     }
 }
 
+void RoutingProtocolImpl::check_ls_timeouts() {
+    unsigned int current_time = sys->time();
+
+    for (auto it = ls_database.begin(); it != ls_database.end();) {
+        if (current_time - it->second.last_updated > 45000) {
+            it = ls_database.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
 
 /**
  * @brief 转发数据包
