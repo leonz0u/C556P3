@@ -236,6 +236,21 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
                        router_id, src_id);
         }
     }
+    if (protocol_type == P_LS && (topology_changed || cost_changed)) {
+        // 更新链路状态数据库
+        auto link_key = std::make_pair(router_id, src_id);
+        if (ls_database.find(link_key) == ls_database.end() || 
+            ls_database[link_key].cost != rtt) {
+            ls_database[link_key] = {router_id, src_id, rtt, sys->time(), 0};
+            DEBUG_PRINT("Router %d: Updated LS database for link (%d -> %d) with cost %u\n", 
+                        router_id, router_id, src_id, rtt);
+        }
+        
+        // 触发链路状态更新广播
+        send_ls_update(true);
+        DEBUG_PRINT("Router %d: Triggered LS update due to change in link (%d -> %d)\n", 
+                    router_id, router_id, src_id);
+    }
     
     delete[] pkt;
 }
@@ -276,6 +291,15 @@ void RoutingProtocolImpl::check_neighbors() {
                             }
                         }
                     }
+                    // 如果是 LS 协议，直接删除链路状态条目
+                    if (protocol_type == P_LS) {
+                        auto link_key = std::make_pair(router_id, failed_neighbor);
+                        if (ls_database.find(link_key) != ls_database.end()) {
+                            ls_database.erase(link_key);  // 删除失效链路
+                            DEBUG_PRINT("Router %d: Removed link (%d -> %d) from LS database\n", 
+                                        router_id, router_id, failed_neighbor);
+                        }
+                    }
                     
                     DEBUG_PRINT("Router %d detected link failure on port %d to Router %d\n", 
                               router_id, port, failed_neighbor);
@@ -287,6 +311,10 @@ void RoutingProtocolImpl::check_neighbors() {
     // 如果拓扑发生变化且使用DV协议，触发更新
     if (topology_changed && protocol_type == P_DV) {
         send_dv_update(true);
+    }
+    else if (protocol_type == P_LS) {
+            // LS 协议触发链路状态广播
+            send_ls_update(true);
     }
 }
 
@@ -736,38 +764,109 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
 
 
 void RoutingProtocolImpl::compute_shortest_paths() {
-    std::map<unsigned short, unsigned short> dist;
+    // 创建节点集合
+    std::set<unsigned short> nodes;
+    for (const auto& entry : ls_database) {
+        nodes.insert(entry.second.src);
+        nodes.insert(entry.second.dst);
+    }
+
+    // 初始化距离和前驱节点
+    std::map<unsigned short, unsigned int> dist;
     std::map<unsigned short, unsigned short> prev;
-    std::set<unsigned short> visited;
+    for (auto node : nodes) {
+        dist[node] = UINT_MAX; // 使用无穷大表示不可达
+    }
+    dist[router_id] = 0; // 自己到自己的距离为0
 
-    dist[router_id] = 0;
+    // 创建一个未访问节点的集合
+    std::set<unsigned short> unvisited = nodes;
 
-    while (visited.size() < ls_database.size()) {
+    while (!unvisited.empty()) {
+        // 从未访问的节点中选择距离最小的节点
         unsigned short min_node = 0;
-        unsigned short min_dist = USHRT_MAX;
+        unsigned int min_dist = UINT_MAX;
 
-        for (auto &entry : dist) {
-            if (visited.find(entry.first) == visited.end() && entry.second < min_dist) {
-                min_node = entry.first;
-                min_dist = entry.second;
+        for (auto node : unvisited) {
+            if (dist[node] < min_dist) {
+                min_dist = dist[node];
+                min_node = node;
             }
         }
 
-        visited.insert(min_node);
+        if (min_dist == UINT_MAX) {
+            // 剩余的节点不可达
+            break;
+        }
 
-        for (auto &entry : ls_database) {
+        unvisited.erase(min_node);
+
+        // 处理邻居节点
+        for (const auto& entry : ls_database) {
+            unsigned short neighbor = 0;
+            unsigned int cost = 0;
+
             if (entry.second.src == min_node) {
-                unsigned short neighbor = entry.second.dst;
-                unsigned short new_cost = dist[min_node] + entry.second.cost;
+                neighbor = entry.second.dst;
+                cost = entry.second.cost;
+            } else if (entry.second.dst == min_node) {
+                neighbor = entry.second.src;
+                cost = entry.second.cost;
+            } else {
+                continue;
+            }
 
-                if (dist.find(neighbor) == dist.end() || new_cost < dist[neighbor]) {
-                    dist[neighbor] = new_cost;
+            if (unvisited.find(neighbor) != unvisited.end()) {
+                unsigned int alt = dist[min_node] + cost;
+                if (alt < dist[neighbor]) {
+                    dist[neighbor] = alt;
                     prev[neighbor] = min_node;
                 }
             }
         }
     }
+
+    // 更新路由表（使用 dv_table）
+    dv_table.clear(); // 清空原有的路由表
+
+    for (auto node : nodes) {
+        if (node == router_id || dist[node] == UINT_MAX) {
+            continue; // 跳过自己和不可达的节点
+        }
+
+        // 通过前驱节点链找到下一跳
+        unsigned short next_hop = node;
+        while (prev[next_hop] != router_id) {
+            next_hop = prev[next_hop];
+        }
+
+        // 找到与下一跳相连的端口
+        unsigned short port = INFINITY_COST;
+        for (unsigned short p = 0; p < num_ports; p++) {
+            if (ports[p].neighbor_id == next_hop && ports[p].is_alive) {
+                port = p;
+                break;
+            }
+        }
+
+        if (port == INFINITY_COST) {
+            // 未找到有效的端口，跳过
+            continue;
+        }
+
+        // 更新路由表
+        DVEntry entry;
+        entry.next_hop = next_hop;
+        entry.port = port;
+        entry.cost = dist[node];
+        entry.last_updated = sys->time();
+        dv_table[node] = entry;
+    }
+
+    // 可选：打印更新后的路由表
+    print_dv_table();
 }
+
 
 void RoutingProtocolImpl::check_dv_timeouts() {
     unsigned int current_time = sys->time();
