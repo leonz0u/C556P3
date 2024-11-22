@@ -172,7 +172,7 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
     memcpy(&ping_time, pkt + 8, 4);
     
     // 计算RTT
-    unsigned int rtt = current_time - ping_time;
+    unsigned short rtt = current_time - ping_time;
     
     // 获取并记录邻居ID
     unsigned short src_id;
@@ -202,7 +202,8 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
     // 如果使用DV协议，更新到邻居的路由信息
     if (protocol_type == P_DV) {
         // 更新到邻居的路由信息update_dv_entry
-        bool route_updated = update_dv_entry(src_id, src_id, port, rtt);
+        // path cost not rtt because rtt is recorded in port.cost
+        bool route_updated = update_dv_entry(src_id, src_id, port, 0);
         
         // 如果是新邻居或路由有更新，触发DV更新
         if (topology_changed || route_updated) {
@@ -609,7 +610,7 @@ void RoutingProtocolImpl::handle_dv_packet(unsigned short port, void *packet, un
     }
     
     bool updated = false;
-    unsigned int current_time = sys->time();
+    // unsigned int current_time = sys->time();
     
     // 从包中提取DV表项
     int offset = 8;
@@ -819,7 +820,7 @@ void RoutingProtocolImpl::compute_shortest_paths() {
 
 void RoutingProtocolImpl::check_dv() {
     unsigned int current_time = sys->time();
-    bool updated = false;
+    // bool updated = false;
     std::vector<unsigned short> to_delete;
     
     // 首先标记所有超时的路由为INFINITY_COST
@@ -828,7 +829,7 @@ void RoutingProtocolImpl::check_dv() {
             if (current_time - entry.second.last_updated >= 45000 || // 45秒超时
                 entry.second.cost == INFINITY_COST) {               // 已标记为无效
                 to_delete.push_back(entry.first);
-                updated = true;
+                // updated = true;
             }
         }
     }
@@ -839,9 +840,9 @@ void RoutingProtocolImpl::check_dv() {
         DEBUG_PRINT("Router %d: Removed invalid route to %d\n", router_id, dest);
     }
     
-    if (updated) {
-        send_dv_update(true);
-    }
+    // if (updated) {
+    //     send_dv_update(true);
+    // }
 }
 
 void RoutingProtocolImpl::check_ls_timeouts() {
@@ -894,22 +895,33 @@ void RoutingProtocolImpl::forward_data_packet(unsigned short port, void *packet,
  * @param dest 目的地路由器ID
  * @param next_hop 下一跳路由器ID
  * @param port 出口端口号
- * @param cost 到目的地的成本
+ * @param path_cost 到目的地的成本
  * @return bool 如果路由表发生更新返回true，否则返回false
  */
 bool RoutingProtocolImpl::update_dv_entry(unsigned short dest, unsigned short next_hop,
-                                        unsigned short port, unsigned short cost) {
+                                        unsigned short port, unsigned short path_cost) {
     bool updated = false;
     unsigned int current_time = sys->time();
-    
-    // 不要更新到自己的路由
+
+    // do not update route to self
     if (dest == router_id) {
-        return false;
+        updated = false;
+        return updated;
     }
+
+    // if port is down, then the route is invalid
+    if (!ports[port].is_alive) {
+        updated = false;
+        return updated;
+    }
+
+    // if the path cost is INFINITY_COST, then the cost is INFINITY_COST
+    // if the path cost is not INFINITY_COST, then the cost is the sum of the path cost and the cost to the next hop
+    unsigned short cost = (path_cost == INFINITY_COST) ? INFINITY_COST : path_cost + ports[port].cost;
     
     auto it = dv_table.find(dest);
     if (it == dv_table.end()) {
-        // 新路由
+        // add new route
         if (cost != INFINITY_COST) {
             DVEntry entry;
             entry.next_hop = next_hop;
@@ -922,45 +934,56 @@ bool RoutingProtocolImpl::update_dv_entry(unsigned short dest, unsigned short ne
                        router_id, dest, next_hop, cost);
         }
     } else {
-        // 检查是否真的需要更新
-        bool need_update = false;
-        if (cost == INFINITY_COST && it->second.next_hop == next_hop) {
-            // 当前路径变为无效
-            need_update = true;
-        } else if (cost != INFINITY_COST && 
-                  (cost < it->second.cost ||                    // 更好的路径
-                   (it->second.next_hop == next_hop &&         // 当前路径的更新
-                    cost != it->second.cost))) {               // 且成本有变化
-            need_update = true;
-        }
-        
-        if (need_update) {
-            it->second.next_hop = next_hop;
-            it->second.port = port;
-            it->second.cost = cost;
-            it->second.last_updated = current_time;
+        // if receive a route with cost INFINITY_COST and it->second.cost is not INFINITY_COST and next_hop is the same
+        if (cost == INFINITY_COST && it->second.cost != INFINITY_COST && next_hop == it->second.next_hop){
+            it->second.cost = INFINITY_COST;
+            // set last_updated to 0 to indicate that the route is invalid
+            it->second.last_updated = 0;
             updated = true;
-            DEBUG_PRINT("Router %d: Updating route to %d via %d with cost %d\n",
-                       router_id, dest, next_hop, cost);
+            DEBUG_PRINT("Router %d: Removing route to %d\n", router_id, dest);
         }
-        else {
-            // no need to update, only update the last_updated time
-            it->second.last_updated = current_time;
+        // if cost is not INFINITY_COST, then the route is valid
+        if (cost < INFINITY_COST){
+            // if the route is the same as the current one and the cost is the same, only update the last_updated time
+            if (it->second.next_hop == next_hop && cost == it->second.cost)
+            {
+                // if latest update is more than 15 seconds ago, update the last_updated time
+                if (current_time - it->second.last_updated > 15000)
+                {
+                    it->second.last_updated = current_time;
+                    updated = true;
+                    DEBUG_PRINT("Router %d: Updating last_updated time for route to %d via %d with cost %d\n",
+                                router_id, dest, next_hop, cost);
+                }
+                updated = false;
+                return updated;
+            }            
+            // check cost if it is better than the current one or it is the same route but with different cost
+            if (cost < it->second.cost || (it->second.next_hop == next_hop && cost != it->second.cost))
+            {
+                it->second.next_hop = next_hop;
+                it->second.port = port;
+                it->second.cost = cost;
+                it->second.last_updated = current_time;
+                updated = true;
+                DEBUG_PRINT("Router %d: Updating route to %d via %d with cost %d\n",
+                            router_id, dest, next_hop, cost);
+            }
         }
     }
     
-    if (updated) {
-        print_dv_table();
-    }
+    // if (updated) {
+    //     print_dv_table();
+    // }
     
     return updated;
 }
 
 void RoutingProtocolImpl::print_dv_table() {
     DEBUG_PRINT("\nRouter %d DV Table:\n", router_id);
-    DEBUG_PRINT("Dest\tNextHop\tPort\tCost\tLastUpdated\n");
+    DEBUG_PRINT("D\t\tNH\t\tP\t\tC\t\tLU\n");
     for (const auto &entry : dv_table) {
-        DEBUG_PRINT("%d\t%d\t%d\t%d\t%u\n",
+        DEBUG_PRINT("%d\t\t%d\t\t%d\t\t%d\t\t%u\n",
                    entry.first,
                    entry.second.next_hop,
                    entry.second.port,
