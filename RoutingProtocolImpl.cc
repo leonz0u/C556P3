@@ -199,43 +199,19 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
     DEBUG_PRINT("Router %d received PONG from Router %d on port %d, RTT = %u ms\n", 
                 router_id, src_id, port, rtt);
     
-    // 如果使用DV协议且是新邻居，确保添加初始路由条目
-    if (protocol_type == P_DV && topology_changed) {
-        // 更新到邻居的路由信息
-        update_dv_entry(src_id, src_id, port, rtt);
+    // 如果使用DV协议，更新到邻居的路由信息
+    if (protocol_type == P_DV) {
+        // 更新到邻居的路由信息update_dv_entry
+        bool route_updated = update_dv_entry(src_id, src_id, port, rtt);
         
-        // 立即发送一个DV更新，因为我们有了新邻居
-        send_dv_update(true);
-        DEBUG_PRINT("Router %d: Triggered DV update due to new neighbor %d\n", 
-                   router_id, src_id);
-    }
-    // 如果只是成本变化，也需要更新
-    else if (protocol_type == P_DV && cost_changed) {
-        // 更新到邻居的路由信息
-        update_dv_entry(src_id, src_id, port, rtt);
-        
-        // 检查是否需要更新通过这个邻居的其他路由
-        bool routes_updated = false;
-        for (auto &entry : dv_table) {
-            if (entry.second.next_hop == src_id) {
-                // 重新计算通过这个邻居的路由成本
-                unsigned short new_cost = rtt + 
-                    (entry.first == src_id ? 0 : entry.second.cost - ports[port].cost);
-                if (new_cost != entry.second.cost) {
-                    entry.second.cost = new_cost;
-                    entry.second.last_updated = current_time;
-                    routes_updated = true;
-                }
-            }
-        }
-        
-        // 如果有路由更新，触发DV更新
-        if (routes_updated) {
+        // 如果是新邻居或路由有更新，触发DV更新
+        if (topology_changed || route_updated) {
             send_dv_update(true);
-            DEBUG_PRINT("Router %d: Triggered DV update due to cost change to neighbor %d\n", 
+            DEBUG_PRINT("Router %d: Triggered DV update due to neighbor change/update %d\n", 
                        router_id, src_id);
         }
     }
+
     if (protocol_type == P_LS && (topology_changed || cost_changed)) {
         // 更新链路状态数据库
         auto link_key = std::make_pair(router_id, src_id);
@@ -279,24 +255,22 @@ void RoutingProtocolImpl::check_neighbors() {
                     // 记录失效的邻居ID
                     unsigned short failed_neighbor = ports[port].neighbor_id;
                     
+ 
                     // 更新DV表
-                    bool removed = false;
                     if (protocol_type == P_DV) {
-                        // 移除通过该邻居的路由
-                        auto it = dv_table.begin();
-                        while (it != dv_table.end()) {
-                            if (it->second.next_hop == failed_neighbor) {
-                                it = dv_table.erase(it);
-                                removed = true;
-                            } else {
-                                ++it;
+                        bool routes_updated = false;
+                        for (auto &entry : dv_table) {
+                            if (entry.second.next_hop == failed_neighbor) {
+                                entry.second.cost = INFINITY_COST;
+                                entry.second.last_updated = 0;
+                                routes_updated = true;
                             }
                         }
-                        // print dv table if removed
-                        if (removed) {
-                            print_dv_table();
+                        if (routes_updated) {
+                            topology_changed = true;
                         }
                     }
+
                     // 如果是 LS 协议，直接删除链路状态条目
                     if (protocol_type == P_LS) {
                         auto link_key = std::make_pair(router_id, failed_neighbor);
@@ -383,7 +357,7 @@ void RoutingProtocolImpl::handle_alarm(void *data) {
             check_neighbors();  // 检查邻居状态
             
             if (protocol_type == P_DV) {
-                check_dv_timeouts();  // 检查路由超时
+                check_dv();  // 检查路由超时
             } else if(protocol_type == P_LS){
                 check_ls_timeouts();
             }
@@ -652,39 +626,8 @@ void RoutingProtocolImpl::handle_dv_packet(unsigned short port, void *packet, un
             continue;
         }
         
-        // 合法性检查
-        if (cost != INFINITY_COST) {
-            unsigned short total_cost = cost + ports[port].cost;
-            
-            // 检查是否会溢出
-            if (total_cost < cost || total_cost < ports[port].cost) {
-                DEBUG_PRINT("Router %d: Cost overflow detected for dest %d\n", router_id, dest);
-                offset += 4;
-                continue;
-            }
-            
-            if (total_cost > INFINITY_COST) {
-                total_cost = INFINITY_COST;
-            }
-            
-            // 更新路由表
-            bool route_updated = update_dv_entry(dest, src_id, port, total_cost);
-            if (route_updated) {
-                updated = true;
-                DEBUG_PRINT("Router %d: Updated route to %d via %d (port %d) with cost %d\n",
-                           router_id, dest, src_id, port, total_cost);
-            }
-        } else {
-            // 处理无穷大的情况
-            auto it = dv_table.find(dest);
-            if (it != dv_table.end() && it->second.next_hop == src_id) {
-                // 如果当前路由通过这个邻居，需要移除
-                dv_table.erase(it);
-                updated = true;
-                DEBUG_PRINT("Router %d: Removed route to %d due to infinity cost from %d\n",
-                           router_id, dest, src_id);
-            }
-        }
+        // 更新DV表
+        updated |= update_dv_entry(dest, src_id, port, cost);
         
         offset += 4;
     }
@@ -874,20 +817,26 @@ void RoutingProtocolImpl::compute_shortest_paths() {
 }
 
 
-void RoutingProtocolImpl::check_dv_timeouts() {
+void RoutingProtocolImpl::check_dv() {
     unsigned int current_time = sys->time();
     bool updated = false;
+    std::vector<unsigned short> to_delete;
     
-    // 检查所有路由项
-    auto it = dv_table.begin();
-    while (it != dv_table.end()) {
-        if (it->first != router_id && // 不检查到自身的路由
-            current_time - it->second.last_updated >= 45000) { // 45秒超时
-            it = dv_table.erase(it);
-            updated = true;
-        } else {
-            ++it;
+    // 首先标记所有超时的路由为INFINITY_COST
+    for (auto &entry : dv_table) {
+        if (entry.first != router_id) {  // 不处理到自身的路由
+            if (current_time - entry.second.last_updated >= 45000 || // 45秒超时
+                entry.second.cost == INFINITY_COST) {               // 已标记为无效
+                to_delete.push_back(entry.first);
+                updated = true;
+            }
         }
+    }
+    
+    // 统一删除所有无效路由
+    for (const auto &dest : to_delete) {
+        dv_table.erase(dest);
+        DEBUG_PRINT("Router %d: Removed invalid route to %d\n", router_id, dest);
     }
     
     if (updated) {

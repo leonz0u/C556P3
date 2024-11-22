@@ -106,7 +106,7 @@ class RoutingProtocolImpl : public RoutingProtocol {
         void handle_dv_packet(unsigned short port, void *packet, unsigned short size);
         bool update_dv_entry(unsigned short dest, unsigned short next_hop, 
                             unsigned short port, unsigned short cost);
-        void check_dv_timeouts();
+        void check_dv();
         void forward_data_packet(unsigned short port, void *packet, unsigned short size);
         void print_dv_table(); 
 
