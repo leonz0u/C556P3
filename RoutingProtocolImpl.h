@@ -41,18 +41,25 @@ struct DVEntry {
 
 // LS表项结构
 struct LSEntry {
-    unsigned short src;            // 源路由器ID
-    unsigned short dst;            // 目的地路由器ID
-    unsigned short cost;           // 链路成本
-    unsigned int seq_num;          // 序列号
-    unsigned int last_updated;     // 最后更新时间
+    unsigned short src;
+    unsigned short dst;
+    unsigned short cost;
+    unsigned int seq_num;
+    unsigned int last_updated;
 
     LSEntry() : src(0), dst(0), cost(0), seq_num(0), last_updated(0) {}
-
-    LSEntry(unsigned short s, unsigned short d, unsigned short c, unsigned int seq, unsigned int last)
-        : src(s), dst(d), cost(c), seq_num(seq), last_updated(last) {}
 };
+
+struct LSRouteEntry {
+    unsigned short next_hop;  // 下一跳路由器 ID
+    unsigned short port;      // 出口端口
+    unsigned int cost;        // 到目的地的总成本
+
+    LSRouteEntry() : next_hop(INFINITY_COST), port(INFINITY_COST), cost(INFINITY_COST) {}
+};
+
 typedef std::map<std::pair<unsigned short, unsigned short>, LSEntry> LSDatabase;
+typedef std::map<unsigned short, LSRouteEntry> ls_routing_table;
 
 class RoutingProtocolImpl : public RoutingProtocol {
   public:
@@ -94,6 +101,7 @@ class RoutingProtocolImpl : public RoutingProtocol {
         std::vector<PortStatus> ports;     // 端口状态表
         std::map<unsigned short, DVEntry> dv_table;  // 距离向量表
         LSDatabase ls_database; // 链路状态数据库
+        ls_routing_table lsRoutingTable;  // 修改成员变量名称
 
         // PING/PONG相关方法
         void send_ping(unsigned short port);
@@ -107,7 +115,7 @@ class RoutingProtocolImpl : public RoutingProtocol {
         bool update_dv_entry(unsigned short dest, unsigned short next_hop, 
                             unsigned short port, unsigned short cost);
         void check_dv();
-        void forward_data_packet(unsigned short port, void *packet, unsigned short size);
+        void forward_dv_data_packet(unsigned short port, void *packet, unsigned short size);
         void print_dv_table(); 
 
         // LS协议相关方法
@@ -116,7 +124,10 @@ class RoutingProtocolImpl : public RoutingProtocol {
         void update_ls_database(const LSEntry &entry);
         void compute_shortest_paths();
         void check_ls_timeouts();
-        
+        void forward_ls_data_packet(unsigned short port, void *packet, unsigned short size);
+        void print_ls_routing_table();
+        void check_ls();
+
 };
 
 #endif

@@ -215,20 +215,28 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
 
     if (protocol_type == P_LS && (topology_changed || cost_changed)) {
         // 更新链路状态数据库
-        auto link_key = std::make_pair(router_id, src_id);
-        if (ls_database.find(link_key) == ls_database.end() || 
-            ls_database[link_key].cost != rtt) {
-            ls_database[link_key] = {router_id, src_id, rtt, sys->time(), 0};
-            DEBUG_PRINT("Router %d: Updated LS database for link (%d -> %d) with cost %u\n", 
-                        router_id, router_id, src_id, rtt);
+        auto link_key = std::make_pair(std::min(router_id, src_id), std::max(router_id, src_id));
+        LSEntry &lsa = ls_database[link_key];
+
+        // 如果是新的 LSA 或者链路状态发生了变化，递增序列号
+        if (lsa.seq_num == 0 || lsa.cost != rtt) {
+            lsa.seq_num++;
         }
-        
+
+        lsa.src = router_id;
+        lsa.dst = src_id;
+        lsa.cost = rtt;
+        lsa.last_updated = sys->time();
+
+        DEBUG_PRINT("Router %d: Updated LS database for link (%d -> %d) with cost %u and seq_num %u\n",
+                    router_id, router_id, src_id, rtt, lsa.seq_num);
+
         // 触发链路状态更新广播
         send_ls_update(true);
-        DEBUG_PRINT("Router %d: Triggered LS update due to change in link (%d -> %d)\n", 
+        DEBUG_PRINT("Router %d: Triggered LS update due to change in link (%d -> %d)\n",
                     router_id, router_id, src_id);
     }
-    
+
     delete[] pkt;
 }
 
@@ -360,7 +368,8 @@ void RoutingProtocolImpl::handle_alarm(void *data) {
             if (protocol_type == P_DV) {
                 check_dv();  // 检查路由超时
             } else if(protocol_type == P_LS){
-                check_ls_timeouts();
+                // check_ls_timeouts();
+                check_ls();
             }
             
             // 设置下一次周期性检查
@@ -419,7 +428,11 @@ void RoutingProtocolImpl::recv(unsigned short port, void *packet, unsigned short
         case DATA:
             if (port == SPECIAL_PORT) {
                 // 本地产生的数据包
-                forward_data_packet(port, packet, size);
+                if (protocol_type == P_DV) {
+                    forward_dv_data_packet(port, packet, size);
+                } else if(protocol_type == P_LS) {
+                    forward_ls_data_packet(port, packet, size);
+                }
             } else {
                 // 收到需要转发的数据包
                 unsigned short dst_id;
@@ -431,7 +444,11 @@ void RoutingProtocolImpl::recv(unsigned short port, void *packet, unsigned short
                     delete[] pkt;
                 } else {
                     // 需要转发
-                    forward_data_packet(port, packet, size);
+                    if (protocol_type == P_DV) {
+                        forward_dv_data_packet(port, packet, size);
+                    } else if(protocol_type == P_LS) {
+                        forward_ls_data_packet(port, packet, size);
+                    }
                 }
             }
             break;
@@ -528,59 +545,73 @@ void RoutingProtocolImpl::send_ls_update(bool triggered) {
 
     // 基本LS包头: type(1) + reserved(1) + size(2) + src_id(2)
     unsigned short base_size = 8;
-    // 每个LS表项: src_id(2) + dst_id(2) + cost(2) + seq_num(4)
+    // 每个LSA: src_id(2) + dst_id(2) + cost(2) + seq_num(4)
     unsigned short entry_size = 10;
 
-    // 遍历所有端口
+    // 构建要发送的 LSA 列表，只包括成本不为 INFINITY_COST 的 LSAs
+    std::vector<LSEntry> lsas;
+
+    for (const auto &entry_pair : ls_database) {
+        const LSEntry &lsa = entry_pair.second;
+        if (lsa.cost != INFINITY_COST) {
+            lsas.push_back(lsa);
+        }
+    }
+
+    // 如果没有 LSA，需要退出以避免发送空包
+    if (lsas.empty()) {
+        DEBUG_PRINT("Router %d: No LSAs to send, aborting LS update.\n", router_id);
+        return;
+    }
+
+    // 构建并发送 LS 更新包
+    unsigned short packet_size = base_size + entry_size * lsas.size();
+    char *packet = new char[packet_size];
+    memset(packet, 0, packet_size);  // 清零整个包
+
+    // 设置包头
+    packet[0] = LS;  // 包类型
+    packet[1] = 0;   // 保留字段
+    unsigned short size_n = htons(packet_size);
+    memcpy(packet + 2, &size_n, 2);
+    unsigned short src_n = htons(router_id);
+    memcpy(packet + 4, &src_n, 2);
+
+    // 添加 LSA
+    int offset = base_size;
+    for (const auto &lsa : lsas) {
+        unsigned short src = htons(lsa.src);
+        unsigned short dst = htons(lsa.dst);
+        unsigned short cost = htons(lsa.cost);
+        unsigned int seq_num = htonl(lsa.seq_num);
+
+        memcpy(packet + offset, &src, 2);
+        memcpy(packet + offset + 2, &dst, 2);
+        memcpy(packet + offset + 4, &cost, 2);
+        memcpy(packet + offset + 6, &seq_num, 4);
+
+        offset += entry_size;
+    }
+
+    // 发送给所有邻居
     for (unsigned short port = 0; port < num_ports; port++) {
-        // 检查端口是否活跃
         if (!ports[port].is_alive) {
             continue;  // 跳过非活跃端口
         }
 
-        // 收集要发送的链路状态表项
-        std::vector<LSEntry> entries;
+        // 创建包的副本发送
+        char *packet_copy = new char[packet_size];
+        memcpy(packet_copy, packet, packet_size);
+        sys->send(port, packet_copy, packet_size);
 
-        for (const auto &entry : ls_database) {
-            entries.push_back(entry.second);
-        }
-
-        // 即使没有表项也发送更新（空包）
-        unsigned short packet_size = base_size + entry_size * entries.size();
-        char *packet = new char[packet_size];
-        memset(packet, 0, packet_size);  // 清零整个包
-
-        // 设置包头
-        packet[0] = LS;  // 包类型
-        packet[1] = 0;   // 保留字段
-        unsigned short size_n = htons(packet_size);
-        memcpy(packet + 2, &size_n, 2);
-        unsigned short src_n = htons(router_id);
-        memcpy(packet + 4, &src_n, 2);
-
-        // 添加LS表项
-        int offset = base_size;
-        for (const auto &entry : entries) {
-            unsigned short src = htons(entry.src);
-            unsigned short dst = htons(entry.dst);
-            unsigned short cost = htons(entry.cost);
-            unsigned int seq_num = htonl(entry.seq_num);
-
-            memcpy(packet + offset, &src, 2);
-            memcpy(packet + offset + 2, &dst, 2);
-            memcpy(packet + offset + 4, &cost, 2);
-            memcpy(packet + offset + 6, &seq_num, 4);
-
-            offset += entry_size;
-        }
-
-        DEBUG_PRINT("Router %d: Sending LS update to port %d with %zu entries\n",
-                    router_id, port, entries.size());
-
-        sys->send(port, packet, packet_size);
-        // 注意：不要在这里删除packet，因为send()函数会接管内存
+        DEBUG_PRINT("Router %d: Sent LS update to neighbor %d on port %d\n",
+                    router_id, ports[port].neighbor_id, port);
     }
+
+    delete[] packet;  // 释放原始包
 }
+
+
 
 /**
  * @brief 处理接收到的DV更新包
@@ -658,63 +689,128 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
     memcpy(&src_id, pkt + 4, 2);
     src_id = ntohs(src_id);
 
-    DEBUG_PRINT("Router %d: Received LS update from Router %d on port %d\n", 
+    DEBUG_PRINT("Router %d: Received LS update from Router %d on port %d\n",
                 router_id, src_id, port);
 
-    // 确保这是从正确的邻居收到的更新
+    // Ensure this is from the expected neighbor
     if (ports[port].neighbor_id != src_id) {
         DEBUG_PRINT("Router %d: Ignoring LS update from unexpected neighbor %d on port %d\n",
-                   router_id, src_id, port);
+                    router_id, src_id, port);
         delete[] pkt;
         return;
     }
 
-    bool updated = false;
+    bool updated = false;        // 标记是否需要重新计算最短路径
     unsigned int current_time = sys->time();
 
-    // 从包中提取LS表项
+    // Extract LSAs from the packet
     int offset = 8;
-    while (offset < size) {
-        unsigned short link_src, link_dst, link_cost;
+    while (offset + 10 <= size) {  // Ensure we don't read beyond packet size
+        unsigned short lsa_src, lsa_dst, lsa_cost;
         unsigned int seq_num;
 
-        memcpy(&link_src, pkt + offset, 2);
-        memcpy(&link_dst, pkt + offset + 2, 2);
-        memcpy(&link_cost, pkt + offset + 4, 2);
+        memcpy(&lsa_src, pkt + offset, 2);
+        memcpy(&lsa_dst, pkt + offset + 2, 2);
+        memcpy(&lsa_cost, pkt + offset + 4, 2);
         memcpy(&seq_num, pkt + offset + 6, 4);
 
-        link_src = ntohs(link_src);
-        link_dst = ntohs(link_dst);
-        link_cost = ntohs(link_cost);
+        lsa_src = ntohs(lsa_src);
+        lsa_dst = ntohs(lsa_dst);
+        lsa_cost = ntohs(lsa_cost);
         seq_num = ntohl(seq_num);
 
-        // 检查是否需要更新链路状态数据库
-        auto link_key = std::make_pair(link_src, link_dst);
-        if (ls_database.find(link_key) == ls_database.end() || 
-            ls_database[link_key].seq_num < seq_num) {
-            // 更新链路状态条目
-            ls_database[link_key] = {link_src, link_dst, link_cost, seq_num, current_time};
-            updated = true;
-
-            DEBUG_PRINT("Router %d: Updated link state (%d -> %d) with cost %d and seq_num %u\n",
-                        router_id, link_src, link_dst, link_cost, seq_num);
+        // 跳过成本为 INFINITY_COST 的 LSA
+        if (lsa_cost == INFINITY_COST) {
+            offset += 10;
+            continue;
         }
 
-        offset += 10; // 每个表项大小为 10 字节
+        // Determine if we need to update the LS database
+        auto link_key = std::make_pair(std::min(lsa_src, lsa_dst), std::max(lsa_src, lsa_dst));
+        bool need_update = false;
+        bool cost_changed = false;  // 新增变量，标记成本是否发生变化
+
+        auto it = ls_database.find(link_key);
+        if (it == ls_database.end()) {
+            // LSDB 中没有该 LSA，需要添加并可能重新计算最短路径
+            need_update = true;
+            cost_changed = true;  // 新的 LSA，成本视为已变化
+        } else {
+            LSEntry &existing_lsa = it->second;
+
+            if (seq_num > existing_lsa.seq_num) {
+                // 收到更新的 LSA，比较成本
+                need_update = true;
+                if (lsa_cost != existing_lsa.cost) {
+                    cost_changed = true;  // 成本发生变化
+                } else {
+                    cost_changed = false; // 成本未变化
+                }
+            } else if (seq_num == existing_lsa.seq_num && lsa_cost != existing_lsa.cost) {
+                // 序列号相同但成本不同，可能存在问题，但仍更新
+                need_update = true;
+                cost_changed = true;
+            } else {
+                // 序列号不更高，或者成本未变化，不需要更新
+                need_update = false;
+            }
+        }
+
+        if (need_update) {
+            // Update the link state entry in LSDB
+            LSEntry& ls_entry = ls_database[link_key];
+            ls_entry.src = lsa_src;
+            ls_entry.dst = lsa_dst;
+            ls_entry.cost = lsa_cost;
+            ls_entry.seq_num = seq_num;
+            ls_entry.last_updated = current_time;
+
+            if (cost_changed) {
+                updated = true;  // 成本发生变化，需要重新计算最短路径
+                DEBUG_PRINT("Router %d: Updated link state (%d -> %d) with cost %d and seq_num %u\n",
+                            router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
+            } else {
+                // 成本未变化，不需要重新计算最短路径
+                DEBUG_PRINT("Router %d: Received newer LSA (%d -> %d) with same cost %d and higher seq_num %u\n",
+                            router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
+            }
+        }
+
+        offset += 10; // Each LSA is 10 bytes
     }
 
-    // 如果发生更新，重新计算最短路径
+    // If an update occurred that changed costs, recompute shortest paths
     if (updated) {
         DEBUG_PRINT("Router %d: Triggering shortest path computation due to LS update\n", router_id);
         compute_shortest_paths();
+    }
+
+    // Implement flooding mechanism
+    for (unsigned short p = 0; p < num_ports; p++) {
+        if (p == port) {
+            continue;  // Do not flood back to sender
+        }
+        if (!ports[p].is_alive) {
+            continue;  // Skip inactive ports
+        }
+
+        // Send a copy of the packet
+        char *pkt_copy = new char[size];
+        memcpy(pkt_copy, pkt, size);
+        sys->send(p, pkt_copy, size);
+
+        DEBUG_PRINT("Router %d: Flooded LS update to neighbor %d on port %d\n",
+                    router_id, ports[p].neighbor_id, p);
     }
 
     delete[] pkt;
 }
 
 
+
+
 void RoutingProtocolImpl::compute_shortest_paths() {
-    // 创建节点集合
+    // 构建节点集合
     std::set<unsigned short> nodes;
     for (const auto& entry : ls_database) {
         nodes.insert(entry.second.src);
@@ -726,15 +822,16 @@ void RoutingProtocolImpl::compute_shortest_paths() {
     std::map<unsigned short, unsigned short> prev;
     for (auto node : nodes) {
         dist[node] = UINT_MAX; // 使用无穷大表示不可达
+        prev[node] = INFINITY_COST;
     }
-    dist[router_id] = 0; // 自己到自己的距离为0
+    dist[router_id] = 0;
 
-    // 创建一个未访问节点的集合
+    // Dijkstra 算法
     std::set<unsigned short> unvisited = nodes;
 
     while (!unvisited.empty()) {
-        // 从未访问的节点中选择距离最小的节点
-        unsigned short min_node = 0;
+        // 找到未访问节点中距离最小的节点
+        unsigned short min_node = INFINITY_COST;
         unsigned int min_dist = UINT_MAX;
 
         for (auto node : unvisited) {
@@ -744,24 +841,28 @@ void RoutingProtocolImpl::compute_shortest_paths() {
             }
         }
 
-        if (min_dist == UINT_MAX) {
-            // 剩余的节点不可达
+        if (min_node == INFINITY_COST) {
+            // 剩余的节点不可达，退出循环
             break;
         }
 
         unvisited.erase(min_node);
 
-        // 处理邻居节点
-        for (const auto& entry : ls_database) {
-            unsigned short neighbor = 0;
-            unsigned int cost = 0;
+        // 更新邻居节点的距离
+        for (const auto& entry_pair : ls_database) {
+            const LSEntry& ls_entry = entry_pair.second;
+            unsigned short neighbor = INFINITY_COST;
+            unsigned int cost = ls_entry.cost;
 
-            if (entry.second.src == min_node) {
-                neighbor = entry.second.dst;
-                cost = entry.second.cost;
-            } else if (entry.second.dst == min_node) {
-                neighbor = entry.second.src;
-                cost = entry.second.cost;
+            // 跳过成本为 INFINITY_COST 的链路
+            if (cost == INFINITY_COST) {
+                continue;
+            }
+
+            if (ls_entry.src == min_node) {
+                neighbor = ls_entry.dst;
+            } else if (ls_entry.dst == min_node) {
+                neighbor = ls_entry.src;
             } else {
                 continue;
             }
@@ -776,8 +877,8 @@ void RoutingProtocolImpl::compute_shortest_paths() {
         }
     }
 
-    // 更新路由表（使用 dv_table）
-    dv_table.clear(); // 清空原有的路由表
+    // 更新 LS 路由表
+    lsRoutingTable.clear(); // 清除旧的路由信息
 
     for (auto node : nodes) {
         if (node == router_id || dist[node] == UINT_MAX) {
@@ -786,8 +887,13 @@ void RoutingProtocolImpl::compute_shortest_paths() {
 
         // 通过前驱节点链找到下一跳
         unsigned short next_hop = node;
-        while (prev[next_hop] != router_id) {
+        while (prev[next_hop] != router_id && prev[next_hop] != INFINITY_COST) {
             next_hop = prev[next_hop];
+        }
+
+        if (prev[next_hop] == INFINITY_COST) {
+            // 无法找到路径，跳过
+            continue;
         }
 
         // 找到与下一跳相连的端口
@@ -804,18 +910,19 @@ void RoutingProtocolImpl::compute_shortest_paths() {
             continue;
         }
 
-        // 更新路由表
-        DVEntry entry;
-        entry.next_hop = next_hop;
-        entry.port = port;
-        entry.cost = dist[node];
-        entry.last_updated = sys->time();
-        dv_table[node] = entry;
+        // 更新 LS 路由表
+        LSRouteEntry route_entry;
+        route_entry.next_hop = next_hop;
+        route_entry.port = port;
+        route_entry.cost = dist[node];
+        lsRoutingTable[node] = route_entry;
     }
 
-    // 可选：打印更新后的路由表
-    print_dv_table();
+    // 可选：打印更新后的 LS 路由表
+    print_ls_routing_table();
 }
+
+
 
 
 void RoutingProtocolImpl::check_dv() {
@@ -845,17 +952,27 @@ void RoutingProtocolImpl::check_dv() {
     // }
 }
 
-void RoutingProtocolImpl::check_ls_timeouts() {
+void RoutingProtocolImpl::check_ls() {
     unsigned int current_time = sys->time();
+    bool updated = false;
 
     for (auto it = ls_database.begin(); it != ls_database.end();) {
         if (current_time - it->second.last_updated > 45000) {
+            DEBUG_PRINT("Router %d: Removing expired link state (%d -> %d)\n",
+                        router_id, it->second.src, it->second.dst);
             it = ls_database.erase(it);
+            updated = true;
         } else {
             ++it;
         }
     }
+
+    if (updated) {
+        compute_shortest_paths();
+        send_ls_update(true);
+    }
 }
+
 
 /**
  * @brief 转发数据包
@@ -867,7 +984,7 @@ void RoutingProtocolImpl::check_ls_timeouts() {
  * @param packet 数据包指针
  * @param size 数据包大小
  */
-void RoutingProtocolImpl::forward_data_packet(unsigned short port, void *packet, unsigned short size) {
+void RoutingProtocolImpl::forward_dv_data_packet(unsigned short port, void *packet, unsigned short size) {
     char *pkt = (char *)packet;
     unsigned short dst_id;
     memcpy(&dst_id, pkt + 6, 2);
@@ -885,6 +1002,41 @@ void RoutingProtocolImpl::forward_data_packet(unsigned short port, void *packet,
         delete[] pkt;
     }
 }
+
+void RoutingProtocolImpl::forward_ls_data_packet(unsigned short port, void *packet, unsigned short size) {
+    char *pkt = (char *)packet;
+    unsigned short dst_id;
+    memcpy(&dst_id, pkt + 6, 2);
+    dst_id = ntohs(dst_id);
+
+    // 查找路由信息
+    auto it = lsRoutingTable.find(dst_id);
+    if (it != lsRoutingTable.end() && it->second.port != INFINITY_COST) {
+        // 创建新的包副本
+        char *pkt_copy = new char[size];
+        memcpy(pkt_copy, pkt, size);
+        sys->send(it->second.port, pkt_copy, size);
+        delete[] pkt; // 释放原始数据包
+    } else {
+        // 没有路由，丢弃包
+        delete[] pkt;
+    }
+}
+
+
+void RoutingProtocolImpl::print_ls_routing_table() {
+    DEBUG_PRINT("\nRouter %d LS Routing Table:\n", router_id);
+    DEBUG_PRINT("Destination\tNext Hop\tPort\tCost\n");
+    for (const auto &entry : lsRoutingTable) {
+        DEBUG_PRINT("%d\t\t%d\t\t%d\t%u\n",
+                    entry.first,
+                    entry.second.next_hop,
+                    entry.second.port,
+                    entry.second.cost);
+    }
+    DEBUG_PRINT("\n");
+}
+
 
 /**
  * @brief 更新距离向量路由表项
