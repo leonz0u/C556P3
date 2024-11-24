@@ -8,38 +8,36 @@
 #include <cstring>
 #include <arpa/inet.h>
 
-// 定时器类型定义
+// Timer type definition
 enum AlarmType {
-    ALARM_PING = 0,           // 10秒一次的PING
-    ALARM_DV_UPDATE,          // 30秒一次的DV更新
-    ALARM_LS_UPDATE,          // 30秒一次的LS更新
-    ALARM_PERIODIC_CHECK      // 1秒一次的状态检查(合并邻居和路由检查)
+    ALARM_PING = 0,           // PING every 10 seconds
+    ALARM_DV_UPDATE,          // DV update every 30 seconds
+    ALARM_LS_UPDATE,          // LS update every 30 seconds
+    ALARM_PERIODIC_CHECK      // Status check every 1 second (combining neighbor and route checks)
 };
 
-// 端口状态结构
+// Port status structure
 struct PortStatus {
-    unsigned short neighbor_id;    // 邻居路由器ID，初始为INFINITY_COST
-    unsigned int last_ping_time;   // 上次发送PING的时间
-    unsigned int last_pong_time;   // 上次收到PONG的时间
-    bool is_alive;                 // 端口是否活跃
-    unsigned short cost;           // 链路成本(RTT)
+    unsigned short neighbor_id;    // Neighbor router ID, initially set to INFINITY_COST
+    unsigned int last_ping_time;   // Time of the last PING sent
+    unsigned int last_pong_time;   // Time of the last PONG received
+    bool is_alive;                 // Whether the port is active
+    unsigned short cost;           // Link Cost RTT
     
     PortStatus() : neighbor_id(INFINITY_COST), last_ping_time(0), 
                   last_pong_time(0), is_alive(false), cost(INFINITY_COST) {}
 };
 
-// DV表项结构
 struct DVEntry {
-    unsigned short next_hop;       // 下一跳路由器ID
-    unsigned short port;           // 出口端口
-    unsigned short cost;           // 到目的地的总成本
-    unsigned int last_updated;     // 最后更新时间
+    unsigned short next_hop;       // Next-hop router ID
+    unsigned short port;           // Outgoing port
+    unsigned short cost;           // Total cost to the destination
+    unsigned int last_updated;     // Last update time
     
     DVEntry() : next_hop(INFINITY_COST), port(INFINITY_COST), 
                 cost(INFINITY_COST), last_updated(0) {}
 };
 
-// LS表项结构
 struct LSEntry {
     unsigned short src;
     unsigned short dst;
@@ -51,9 +49,9 @@ struct LSEntry {
 };
 
 struct LSRouteEntry {
-    unsigned short next_hop;  // 下一跳路由器 ID
-    unsigned short port;      // 出口端口
-    unsigned int cost;        // 到目的地的总成本
+    unsigned short next_hop;  // Next-hop router ID
+    unsigned short port;      // Outgoing port
+    unsigned int cost;        // Total cost to the destination
 
     LSRouteEntry() : next_hop(INFINITY_COST), port(INFINITY_COST), cost(INFINITY_COST) {}
 };
@@ -94,22 +92,22 @@ class RoutingProtocolImpl : public RoutingProtocol {
     // a neighbor router.
 
  private:
-        Node *sys;                         // 系统接口
-        unsigned short router_id;          // 路由器ID
-        unsigned short num_ports;          // 端口数量
-        eProtocolType protocol_type;       // 协议类型
-        std::vector<PortStatus> ports;     // 端口状态表
-        std::map<unsigned short, DVEntry> dv_table;  // 距离向量表
-        LSDatabase ls_database; // 链路状态数据库
-        ls_routing_table lsRoutingTable;  // 修改成员变量名称
+        Node *sys;                         // System interface
+        unsigned short router_id;          // Router ID
+        unsigned short num_ports;          // Number of ports
+        eProtocolType protocol_type;       // Protocol type
+        std::vector<PortStatus> ports;     // Port status table
+        std::map<unsigned short, DVEntry> dv_table;  // Distance vector table
+        LSDatabase ls_database;            // Link-state database
+        ls_routing_table lsRoutingTable;  
 
-        // PING/PONG相关方法
+        // PING/PONG
         void send_ping(unsigned short port);
         void handle_ping(unsigned short port, void *packet, unsigned short size);
         void handle_pong(unsigned short port, void *packet, unsigned short size);
         void check_neighbors();
 
-        // DV协议相关方法
+        // DV
         void send_dv_update(bool triggered = false);
         void handle_dv_packet(unsigned short port, void *packet, unsigned short size);
         bool update_dv_entry(unsigned short dest, unsigned short next_hop, 
@@ -118,7 +116,7 @@ class RoutingProtocolImpl : public RoutingProtocol {
         void forward_dv_data_packet(unsigned short port, void *packet, unsigned short size);
         void print_dv_table(); 
 
-        // LS协议相关方法
+        // LS
         void add_neighbor_SeqNum();
         void send_ls_update(bool triggered = false);
         void handle_ls_packet(unsigned short port, void *packet, unsigned short size);
