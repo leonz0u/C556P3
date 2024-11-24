@@ -551,11 +551,11 @@ void RoutingProtocolImpl::send_dv_update(bool triggered) {
 // add neighbor SeqNum
 void RoutingProtocolImpl::add_neighbor_SeqNum() {
     // iterlate ls database
-    for (auto &entry : ls_database) {
-        LSEntry &lsa = entry.second;
+    for (auto it = ls_database.begin(); it != ls_database.end(); ) {
+        LSEntry &lsa = it->second;
         // if lsa cost is INFINITY_COST, delete it
         if (lsa.cost == INFINITY_COST) {
-            ls_database.erase(entry.first);
+            it = ls_database.erase(it);
             continue;
         }
 
@@ -563,7 +563,24 @@ void RoutingProtocolImpl::add_neighbor_SeqNum() {
         if (lsa.src == router_id || lsa.dst == router_id) {
             lsa.seq_num++;
         }
+
+        it++;
     }
+
+
+    // for (auto &entry : ls_database) {
+    //     LSEntry &lsa = entry.second;
+    //     // if lsa cost is INFINITY_COST, delete it
+    //     if (lsa.cost == INFINITY_COST) {
+    //         // ls_database.erase(entry.first);
+    //         continue;
+    //     }
+
+    //     // if src or dst is router_id, increase seq_num
+    //     if (lsa.src == router_id || lsa.dst == router_id) {
+    //         lsa.seq_num++;
+    //     }
+    // }
 }
 
 
@@ -833,7 +850,6 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
     if (updated)
     {
         DEBUG_PRINT("Router %d: Triggering shortest path computation due to LS update\n", router_id);
-        compute_shortest_paths();
         // Implement flooding mechanism
         for (unsigned short p = 0; p < num_ports; p++)
         {
@@ -860,6 +876,7 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
             DEBUG_PRINT("Router %d: Flooded LS update to neighbor %d on port %d\n",
                         router_id, ports[p].neighbor_id, p);
         }
+        compute_shortest_paths();
     }
 
     delete[] pkt;
