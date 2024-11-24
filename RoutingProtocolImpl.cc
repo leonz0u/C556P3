@@ -282,12 +282,17 @@ void RoutingProtocolImpl::check_neighbors() {
 
                     // 如果是 LS 协议，直接删除链路状态条目
                     if (protocol_type == P_LS) {
-                        auto link_key = std::make_pair(router_id, failed_neighbor);
-                        if (ls_database.find(link_key) != ls_database.end()) {
-                            ls_database.erase(link_key);  // 删除失效链路
-                            DEBUG_PRINT("Router %d: Removed link (%d -> %d) from LS database\n", 
-                                        router_id, router_id, failed_neighbor);
-                        }
+                        auto link_key = std::make_pair(std::min(router_id, failed_neighbor), std::max(router_id, failed_neighbor));
+                        LSEntry &lsa = ls_database[link_key];
+                        lsa.seq_num++;
+                        lsa.is_valid = false;
+                        lsa.last_updated = sys->time();
+
+                        DEBUG_PRINT("Router %d: Link (%d -> %d) failed, updated LSA with seq_num %u\n",
+                                    router_id, router_id, failed_neighbor, lsa.seq_num);
+
+                        // 触发链路状态更新广播
+                        send_ls_update(true);
                     }
                     
                     DEBUG_PRINT("Router %d detected link failure on port %d to Router %d\n", 
@@ -301,10 +306,10 @@ void RoutingProtocolImpl::check_neighbors() {
     if (topology_changed && protocol_type == P_DV) {
         send_dv_update(true);
     }
-    else if (protocol_type == P_LS) {
-            // LS 协议触发链路状态广播
-            send_ls_update(true);
-    }
+    // else if (protocol_type == P_LS) {
+    //         // LS 协议触发链路状态广播
+    //         send_ls_update(true);
+    // }
 }
 
 /**
@@ -545,17 +550,16 @@ void RoutingProtocolImpl::send_ls_update(bool triggered) {
 
     // 基本LS包头: type(1) + reserved(1) + size(2) + src_id(2)
     unsigned short base_size = 8;
-    // 每个LSA: src_id(2) + dst_id(2) + cost(2) + seq_num(4)
-    unsigned short entry_size = 10;
+    // 每个LSA: src_id(2) + dst_id(2) + seq_num(4) [+ cost(2) 可选]
+    unsigned short entry_size_with_cost = 10;
+    unsigned short entry_size_without_cost = 8;
 
-    // 构建要发送的 LSA 列表，只包括成本不为 INFINITY_COST 的 LSAs
+    // 构建要发送的 LSA 列表，只包含有效的 LSA
     std::vector<LSEntry> lsas;
 
     for (const auto &entry_pair : ls_database) {
         const LSEntry &lsa = entry_pair.second;
-        if (lsa.cost != INFINITY_COST) {
-            lsas.push_back(lsa);
-        }
+        lsas.push_back(lsa);
     }
 
     // 如果没有 LSA，需要退出以避免发送空包
@@ -564,8 +568,16 @@ void RoutingProtocolImpl::send_ls_update(bool triggered) {
         return;
     }
 
-    // 构建并发送 LS 更新包
-    unsigned short packet_size = base_size + entry_size * lsas.size();
+    // 计算包大小
+    unsigned short packet_size = base_size;
+    for (const auto &lsa : lsas) {
+        if (lsa.is_valid && lsa.cost != INFINITY_COST) {
+            packet_size += entry_size_with_cost;
+        } else {
+            packet_size += entry_size_without_cost;
+        }
+    }
+
     char *packet = new char[packet_size];
     memset(packet, 0, packet_size);  // 清零整个包
 
@@ -582,15 +594,20 @@ void RoutingProtocolImpl::send_ls_update(bool triggered) {
     for (const auto &lsa : lsas) {
         unsigned short src = htons(lsa.src);
         unsigned short dst = htons(lsa.dst);
-        unsigned short cost = htons(lsa.cost);
         unsigned int seq_num = htonl(lsa.seq_num);
 
         memcpy(packet + offset, &src, 2);
         memcpy(packet + offset + 2, &dst, 2);
-        memcpy(packet + offset + 4, &cost, 2);
-        memcpy(packet + offset + 6, &seq_num, 4);
+        memcpy(packet + offset + 4, &seq_num, 4);
 
-        offset += entry_size;
+        if (lsa.is_valid && lsa.cost != INFINITY_COST) {
+            unsigned short cost = htons(lsa.cost);
+            memcpy(packet + offset + 8, &cost, 2);
+            offset += entry_size_with_cost;
+        } else {
+            // 无效的 LSA，不包含成本信息
+            offset += entry_size_without_cost;
+        }
     }
 
     // 发送给所有邻居
@@ -705,53 +722,49 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
 
     // Extract LSAs from the packet
     int offset = 8;
-    while (offset + 10 <= size) {  // Ensure we don't read beyond packet size
-        unsigned short lsa_src, lsa_dst, lsa_cost;
+    while (offset + 8 <= size) {  // Ensure we don't read beyond packet size
+        unsigned short lsa_src, lsa_dst;
         unsigned int seq_num;
 
         memcpy(&lsa_src, pkt + offset, 2);
         memcpy(&lsa_dst, pkt + offset + 2, 2);
-        memcpy(&lsa_cost, pkt + offset + 4, 2);
-        memcpy(&seq_num, pkt + offset + 6, 4);
+        memcpy(&seq_num, pkt + offset + 4, 4);
 
         lsa_src = ntohs(lsa_src);
         lsa_dst = ntohs(lsa_dst);
-        lsa_cost = ntohs(lsa_cost);
         seq_num = ntohl(seq_num);
 
-        // 跳过成本为 INFINITY_COST 的 LSA
-        if (lsa_cost == INFINITY_COST) {
-            offset += 10;
-            continue;
+        // Check if cost is included
+        bool has_cost = false;
+        unsigned short lsa_cost = 0;
+        if (offset + 10 <= size) {
+            // Peek at the next LSA to see if it starts with a valid src_id
+            unsigned short next_src_id;
+            memcpy(&next_src_id, pkt + offset + 8, 2);
+            next_src_id = ntohs(next_src_id);
+            if (next_src_id == lsa_src || offset + 10 == size) {
+                has_cost = true;
+                memcpy(&lsa_cost, pkt + offset + 8, 2);
+                lsa_cost = ntohs(lsa_cost);
+            }
         }
 
         // Determine if we need to update the LS database
         auto link_key = std::make_pair(std::min(lsa_src, lsa_dst), std::max(lsa_src, lsa_dst));
         bool need_update = false;
-        bool cost_changed = false;  // 新增变量，标记成本是否发生变化
 
         auto it = ls_database.find(link_key);
         if (it == ls_database.end()) {
             // LSDB 中没有该 LSA，需要添加并可能重新计算最短路径
             need_update = true;
-            cost_changed = true;  // 新的 LSA，成本视为已变化
         } else {
             LSEntry &existing_lsa = it->second;
 
             if (seq_num > existing_lsa.seq_num) {
-                // 收到更新的 LSA，比较成本
+                // 收到更新的 LSA
                 need_update = true;
-                if (lsa_cost != existing_lsa.cost) {
-                    cost_changed = true;  // 成本发生变化
-                } else {
-                    cost_changed = false; // 成本未变化
-                }
-            } else if (seq_num == existing_lsa.seq_num && lsa_cost != existing_lsa.cost) {
-                // 序列号相同但成本不同，可能存在问题，但仍更新
-                need_update = true;
-                cost_changed = true;
             } else {
-                // 序列号不更高，或者成本未变化，不需要更新
+                // 序列号不更高，不需要更新
                 need_update = false;
             }
         }
@@ -761,25 +774,33 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
             LSEntry& ls_entry = ls_database[link_key];
             ls_entry.src = lsa_src;
             ls_entry.dst = lsa_dst;
-            ls_entry.cost = lsa_cost;
             ls_entry.seq_num = seq_num;
             ls_entry.last_updated = current_time;
 
-            if (cost_changed) {
-                updated = true;  // 成本发生变化，需要重新计算最短路径
+            if (has_cost) {
+                ls_entry.cost = lsa_cost;
+                ls_entry.is_valid = true;
                 DEBUG_PRINT("Router %d: Updated link state (%d -> %d) with cost %d and seq_num %u\n",
                             router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
             } else {
-                // 成本未变化，不需要重新计算最短路径
-                DEBUG_PRINT("Router %d: Received newer LSA (%d -> %d) with same cost %d and higher seq_num %u\n",
-                            router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
+                ls_entry.cost = INFINITY_COST;
+                ls_entry.is_valid = false;
+                DEBUG_PRINT("Router %d: Link state (%d -> %d) marked as invalid with seq_num %u\n",
+                            router_id, lsa_src, lsa_dst, seq_num);
             }
+
+            updated = true;
         }
 
-        offset += 10; // Each LSA is 10 bytes
+        // Adjust offset
+        if (has_cost) {
+            offset += 10; // Each LSA with cost is 10 bytes
+        } else {
+            offset += 8;  // Each LSA without cost is 8 bytes
+        }
     }
 
-    // If an update occurred that changed costs, recompute shortest paths
+    // If an update occurred, recompute shortest paths
     if (updated) {
         DEBUG_PRINT("Router %d: Triggering shortest path computation due to LS update\n", router_id);
         compute_shortest_paths();
@@ -809,12 +830,15 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
 
 
 
+
 void RoutingProtocolImpl::compute_shortest_paths() {
     // 构建节点集合
     std::set<unsigned short> nodes;
     for (const auto& entry : ls_database) {
-        nodes.insert(entry.second.src);
-        nodes.insert(entry.second.dst);
+        if (entry.second.is_valid) {
+            nodes.insert(entry.second.src);
+            nodes.insert(entry.second.dst);
+        }
     }
 
     // 初始化距离和前驱节点
@@ -851,13 +875,13 @@ void RoutingProtocolImpl::compute_shortest_paths() {
         // 更新邻居节点的距离
         for (const auto& entry_pair : ls_database) {
             const LSEntry& ls_entry = entry_pair.second;
+
+            if (!ls_entry.is_valid) {
+                continue; // 跳过无效的 LSA
+            }
+
             unsigned short neighbor = INFINITY_COST;
             unsigned int cost = ls_entry.cost;
-
-            // 跳过成本为 INFINITY_COST 的链路
-            if (cost == INFINITY_COST) {
-                continue;
-            }
 
             if (ls_entry.src == min_node) {
                 neighbor = ls_entry.dst;
@@ -925,6 +949,7 @@ void RoutingProtocolImpl::compute_shortest_paths() {
 
 
 
+
 void RoutingProtocolImpl::check_dv() {
     unsigned int current_time = sys->time();
     // bool updated = false;
@@ -956,14 +981,14 @@ void RoutingProtocolImpl::check_ls() {
     unsigned int current_time = sys->time();
     bool updated = false;
 
-    for (auto it = ls_database.begin(); it != ls_database.end();) {
-        if (current_time - it->second.last_updated > 45000) {
-            DEBUG_PRINT("Router %d: Removing expired link state (%d -> %d)\n",
+    for (auto it = ls_database.begin(); it != ls_database.end(); ++it) {
+        if (current_time - it->second.last_updated > 45000 && it->second.is_valid) {
+            DEBUG_PRINT("Router %d: Expiring link state (%d -> %d)\n",
                         router_id, it->second.src, it->second.dst);
-            it = ls_database.erase(it);
+            it->second.seq_num++;
+            it->second.is_valid = false;
+            it->second.last_updated = current_time;
             updated = true;
-        } else {
-            ++it;
         }
     }
 
@@ -972,6 +997,7 @@ void RoutingProtocolImpl::check_ls() {
         send_ls_update(true);
     }
 }
+
 
 
 /**
