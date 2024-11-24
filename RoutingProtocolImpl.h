@@ -46,11 +46,9 @@ struct LSEntry {
     unsigned short cost;
     unsigned int seq_num;
     unsigned int last_updated;
-    bool is_valid; // 新增字段
 
-    LSEntry() : src(0), dst(0), cost(0), seq_num(0), last_updated(0), is_valid(true) {}
+    LSEntry() : src(0), dst(0), cost(0), seq_num(0), last_updated(0) {}
 };
-
 
 struct LSRouteEntry {
     unsigned short next_hop;  // 下一跳路由器 ID
