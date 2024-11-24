@@ -830,32 +830,36 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
     }
 
     // If an update occurred that changed costs, recompute shortest paths
-    if (updated) {
+    if (updated)
+    {
         DEBUG_PRINT("Router %d: Triggering shortest path computation due to LS update\n", router_id);
         compute_shortest_paths();
-    }
+        // Implement flooding mechanism
+        for (unsigned short p = 0; p < num_ports; p++)
+        {
+            if (p == port)
+            {
+                continue; // Do not flood back to sender
+            }
+            if (!ports[p].is_alive)
+            {
+                continue; // Skip inactive ports
+            }
 
-    // Implement flooding mechanism
-    for (unsigned short p = 0; p < num_ports; p++) {
-        if (p == port) {
-            continue;  // Do not flood back to sender
+            // not send to packet where it originally came from
+            if (ports[p].neighbor_id == src_id)
+            {
+                continue;
+            }
+
+            // Send a copy of the packet
+            char *pkt_copy = new char[size];
+            memcpy(pkt_copy, pkt, size);
+            sys->send(p, pkt_copy, size);
+
+            DEBUG_PRINT("Router %d: Flooded LS update to neighbor %d on port %d\n",
+                        router_id, ports[p].neighbor_id, p);
         }
-        if (!ports[p].is_alive) {
-            continue;  // Skip inactive ports
-        }
-
-        // not send to packet where it originally came from
-        if (ports[p].neighbor_id == src_id) {
-            continue;
-        }
-
-        // Send a copy of the packet
-        char *pkt_copy = new char[size];
-        memcpy(pkt_copy, pkt, size);
-        sys->send(p, pkt_copy, size);
-
-        DEBUG_PRINT("Router %d: Flooded LS update to neighbor %d on port %d\n",
-                    router_id, ports[p].neighbor_id, p);
     }
 
     delete[] pkt;
