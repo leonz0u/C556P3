@@ -4,7 +4,7 @@
 #include <limits.h>
 #include <set>
 
-#define DEBUG 1
+#define DEBUG 0
 #define DEBUG_PRINT(fmt, ...) \
     do { if (DEBUG) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
 
@@ -235,7 +235,7 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
         lsa.src = link_key.first;
         lsa.dst = link_key.second;
         lsa.cost = rtt;
-        // lsa.last_updated = sys->time();
+        lsa.last_updated = current_time;
 
         DEBUG_PRINT("Router %d: Updated LS database for link (%d -> %d) with cost %u and seq_num %u\n",
                     router_id, router_id, src_id, rtt, lsa.seq_num);
@@ -1002,7 +1002,7 @@ void RoutingProtocolImpl::compute_shortest_paths() {
     }
 
     // 可选：打印更新后的 LS 路由表
-    print_ls_routing_table();
+    // print_ls_routing_table();
 }
 
 
