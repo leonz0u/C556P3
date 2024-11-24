@@ -119,6 +119,7 @@ class RoutingProtocolImpl : public RoutingProtocol {
         void print_dv_table(); 
 
         // LS协议相关方法
+        void add_neighbor_SeqNum();
         void send_ls_update(bool triggered = false);
         void handle_ls_packet(unsigned short port, void *packet, unsigned short size);
         void update_ls_database(const LSEntry &entry);

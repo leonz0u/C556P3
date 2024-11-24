@@ -195,6 +195,15 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
     ports[port].is_alive = true;
     ports[port].neighbor_id = src_id;
     ports[port].cost = rtt;
+
+    // if using LS protocol, update LS entry last updated time
+    if (protocol_type == P_LS) {
+        auto link_key = std::make_pair(std::min(router_id, src_id), std::max(router_id, src_id));
+        if (ls_database.find(link_key) != ls_database.end()) {
+            LSEntry &lsa = ls_database[link_key];
+            lsa.last_updated = current_time;
+        }
+    }
     
     DEBUG_PRINT("Router %d received PONG from Router %d on port %d, RTT = %u ms\n", 
                 router_id, src_id, port, rtt);
@@ -223,10 +232,10 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
             lsa.seq_num++;
         }
 
-        lsa.src = router_id;
-        lsa.dst = src_id;
+        lsa.src = link_key.first;
+        lsa.dst = link_key.second;
         lsa.cost = rtt;
-        lsa.last_updated = sys->time();
+        // lsa.last_updated = sys->time();
 
         DEBUG_PRINT("Router %d: Updated LS database for link (%d -> %d) with cost %u and seq_num %u\n",
                     router_id, router_id, src_id, rtt, lsa.seq_num);
@@ -250,6 +259,7 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
 void RoutingProtocolImpl::check_neighbors() {
     unsigned int current_time = sys->time();
     bool topology_changed = false;
+    bool ls_changed = false;
     
     for (unsigned short port = 0; port < num_ports; port++) {
         if (ports[port].last_pong_time > 0) {  // 如果端口曾经收到过PONG
@@ -280,11 +290,16 @@ void RoutingProtocolImpl::check_neighbors() {
                         }
                     }
 
-                    // 如果是 LS 协议，直接删除链路状态条目
+                    // If using LS, update LS entry cost and last_updated time
                     if (protocol_type == P_LS) {
-                        auto link_key = std::make_pair(router_id, failed_neighbor);
+                        auto link_key = std::make_pair(std::min(router_id, failed_neighbor), std::max(router_id, failed_neighbor));
                         if (ls_database.find(link_key) != ls_database.end()) {
-                            ls_database.erase(link_key);  // 删除失效链路
+                            // ls_database.erase(link_key);
+                            LSEntry &lsa = ls_database[link_key];
+                            lsa.seq_num += 1;
+                            lsa.cost = INFINITY_COST;
+                            lsa.last_updated = 0;
+                            ls_changed = true;
                             DEBUG_PRINT("Router %d: Removed link (%d -> %d) from LS database\n", 
                                         router_id, router_id, failed_neighbor);
                         }
@@ -301,7 +316,7 @@ void RoutingProtocolImpl::check_neighbors() {
     if (topology_changed && protocol_type == P_DV) {
         send_dv_update(true);
     }
-    else if (protocol_type == P_LS) {
+    else if (ls_changed && protocol_type == P_LS) {
             // LS 协议触发链路状态广播
             send_ls_update(true);
     }
@@ -355,6 +370,8 @@ void RoutingProtocolImpl::handle_alarm(void *data) {
             if (protocol_type == P_LS) {
                 DEBUG_PRINT("Router %d: Sending periodic LS update at time %u\n", 
                            router_id, sys->time());
+                // add neighbor SeqNum
+                add_neighbor_SeqNum();
                 send_ls_update(false);
                 AlarmType *new_alarm = new AlarmType(ALARM_LS_UPDATE);
                 sys->set_alarm(this, 30000, (void *)new_alarm);
@@ -531,6 +548,25 @@ void RoutingProtocolImpl::send_dv_update(bool triggered) {
     }
 }
 
+// add neighbor SeqNum
+void RoutingProtocolImpl::add_neighbor_SeqNum() {
+    // iterlate ls database
+    for (auto &entry : ls_database) {
+        LSEntry &lsa = entry.second;
+        // if lsa cost is INFINITY_COST, delete it
+        if (lsa.cost == INFINITY_COST) {
+            ls_database.erase(entry.first);
+            continue;
+        }
+
+        // if src or dst is router_id, increase seq_num
+        if (lsa.src == router_id || lsa.dst == router_id) {
+            lsa.seq_num++;
+        }
+    }
+}
+
+
 /**
  * @brief 发送链路状态更新
  * 
@@ -553,7 +589,11 @@ void RoutingProtocolImpl::send_ls_update(bool triggered) {
 
     for (const auto &entry_pair : ls_database) {
         const LSEntry &lsa = entry_pair.second;
-        if (lsa.cost != INFINITY_COST) {
+        // if (lsa.cost != INFINITY_COST) {
+        //     lsas.push_back(lsa);
+        // }
+        // only send LSA with src or dst is router_id
+        if (lsa.src == router_id || lsa.dst == router_id) {
             lsas.push_back(lsa);
         }
     }
@@ -689,16 +729,24 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
     memcpy(&src_id, pkt + 4, 2);
     src_id = ntohs(src_id);
 
-    DEBUG_PRINT("Router %d: Received LS update from Router %d on port %d\n",
-                router_id, src_id, port);
 
-    // Ensure this is from the expected neighbor
-    if (ports[port].neighbor_id != src_id) {
-        DEBUG_PRINT("Router %d: Ignoring LS update from unexpected neighbor %d on port %d\n",
-                    router_id, src_id, port);
+
+    // Ensure this is not from it self
+    if (src_id == router_id) {
+        DEBUG_PRINT("Router %d: Ignoring LS update from itself on port %d\n",
+                    router_id, port);
         delete[] pkt;
         return;
     }
+
+    DEBUG_PRINT("Router %d: Received LS update from Router %d on port %d\n", router_id, src_id, port);
+
+    // if (ports[port].neighbor_id != src_id) {
+    //     DEBUG_PRINT("Router %d: Ignoring LS update from unexpected neighbor %d on port %d\n",
+    //                 router_id, src_id, port);
+    //     delete[] pkt;
+    //     return;
+    // }
 
     bool updated = false;        // 标记是否需要重新计算最短路径
     unsigned int current_time = sys->time();
@@ -720,10 +768,10 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
         seq_num = ntohl(seq_num);
 
         // 跳过成本为 INFINITY_COST 的 LSA
-        if (lsa_cost == INFINITY_COST) {
-            offset += 10;
-            continue;
-        }
+        // if (lsa_cost == INFINITY_COST) {
+        //     offset += 10;
+        //     continue;
+        // }
 
         // Determine if we need to update the LS database
         auto link_key = std::make_pair(std::min(lsa_src, lsa_dst), std::max(lsa_src, lsa_dst));
@@ -753,14 +801,16 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
             } else {
                 // 序列号不更高，或者成本未变化，不需要更新
                 need_update = false;
+                // but need to update last_updated time
+                existing_lsa.last_updated = current_time;
             }
         }
 
         if (need_update) {
             // Update the link state entry in LSDB
             LSEntry& ls_entry = ls_database[link_key];
-            ls_entry.src = lsa_src;
-            ls_entry.dst = lsa_dst;
+            ls_entry.src = link_key.first;
+            ls_entry.dst = link_key.second;
             ls_entry.cost = lsa_cost;
             ls_entry.seq_num = seq_num;
             ls_entry.last_updated = current_time;
@@ -792,6 +842,11 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
         }
         if (!ports[p].is_alive) {
             continue;  // Skip inactive ports
+        }
+
+        // not send to packet where it originally came from
+        if (ports[p].neighbor_id == src_id) {
+            continue;
         }
 
         // Send a copy of the packet
@@ -970,7 +1025,7 @@ void RoutingProtocolImpl::check_ls() {
 
     if (updated) {
         compute_shortest_paths();
-        send_ls_update(true);
+        // send_ls_update(true);
     }
 }
 
