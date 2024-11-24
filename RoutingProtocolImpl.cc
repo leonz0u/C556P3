@@ -892,55 +892,161 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
 
 
 
+// void RoutingProtocolImpl::compute_shortest_paths() {
+//     // 构建节点集合
+//     std::set<unsigned short> nodes;
+//     for (const auto& entry : ls_database) {
+//         nodes.insert(entry.second.src);
+//         nodes.insert(entry.second.dst);
+//     }
+
+//     // 初始化距离和前驱节点
+//     std::map<unsigned short, unsigned int> dist;
+//     std::map<unsigned short, unsigned short> prev;
+//     for (auto node : nodes) {
+//         dist[node] = UINT_MAX; // 使用无穷大表示不可达
+//         prev[node] = INFINITY_COST;
+//     }
+//     dist[router_id] = 0;
+
+//     // Dijkstra 算法
+//     std::set<unsigned short> unvisited = nodes;
+
+//     while (!unvisited.empty()) {
+//         // 找到未访问节点中距离最小的节点
+//         unsigned short min_node = INFINITY_COST;
+//         unsigned int min_dist = UINT_MAX;
+
+//         for (auto node : unvisited) {
+//             if (dist[node] < min_dist) {
+//                 min_dist = dist[node];
+//                 min_node = node;
+//             }
+//         }
+
+//         if (min_node == INFINITY_COST) {
+//             // 剩余的节点不可达，退出循环
+//             break;
+//         }
+
+//         unvisited.erase(min_node);
+
+//         // 更新邻居节点的距离
+//         for (const auto& entry_pair : ls_database) {
+//             const LSEntry& ls_entry = entry_pair.second;
+//             unsigned short neighbor = INFINITY_COST;
+//             unsigned int cost = ls_entry.cost;
+
+//             // 跳过成本为 INFINITY_COST 的链路
+//             if (cost == INFINITY_COST) {
+//                 continue;
+//             }
+
+//             if (ls_entry.src == min_node) {
+//                 neighbor = ls_entry.dst;
+//             } else if (ls_entry.dst == min_node) {
+//                 neighbor = ls_entry.src;
+//             } else {
+//                 continue;
+//             }
+
+//             if (unvisited.find(neighbor) != unvisited.end()) {
+//                 unsigned int alt = dist[min_node] + cost;
+//                 if (alt < dist[neighbor]) {
+//                     dist[neighbor] = alt;
+//                     prev[neighbor] = min_node;
+//                 }
+//             }
+//         }
+//     }
+
+//     // 更新 LS 路由表
+//     lsRoutingTable.clear(); // 清除旧的路由信息
+
+//     for (auto node : nodes) {
+//         if (node == router_id || dist[node] == UINT_MAX) {
+//             continue; // 跳过自己和不可达的节点
+//         }
+
+//         // 通过前驱节点链找到下一跳
+//         unsigned short next_hop = node;
+//         while (prev[next_hop] != router_id && prev[next_hop] != INFINITY_COST) {
+//             next_hop = prev[next_hop];
+//         }
+
+//         if (prev[next_hop] == INFINITY_COST) {
+//             // 无法找到路径，跳过
+//             continue;
+//         }
+
+//         // 找到与下一跳相连的端口
+//         unsigned short port = INFINITY_COST;
+//         for (unsigned short p = 0; p < num_ports; p++) {
+//             if (ports[p].neighbor_id == next_hop && ports[p].is_alive) {
+//                 port = p;
+//                 break;
+//             }
+//         }
+
+//         if (port == INFINITY_COST) {
+//             // 未找到有效的端口，跳过
+//             continue;
+//         }
+
+//         // 更新 LS 路由表
+//         LSRouteEntry route_entry;
+//         route_entry.next_hop = next_hop;
+//         route_entry.port = port;
+//         route_entry.cost = dist[node];
+//         lsRoutingTable[node] = route_entry;
+//     }
+
+//     // 可选：打印更新后的 LS 路由表
+//     // print_ls_routing_table();
+// }
+
 void RoutingProtocolImpl::compute_shortest_paths() {
-    // 构建节点集合
+    // Construct node set and initialize distances
     std::set<unsigned short> nodes;
     for (const auto& entry : ls_database) {
         nodes.insert(entry.second.src);
         nodes.insert(entry.second.dst);
     }
 
-    // 初始化距离和前驱节点
     std::map<unsigned short, unsigned int> dist;
     std::map<unsigned short, unsigned short> prev;
     for (auto node : nodes) {
-        dist[node] = UINT_MAX; // 使用无穷大表示不可达
+        dist[node] = UINT_MAX; // Infinity
         prev[node] = INFINITY_COST;
     }
     dist[router_id] = 0;
 
-    // Dijkstra 算法
-    std::set<unsigned short> unvisited = nodes;
+    // Priority queue: (distance, node)
+    using NodeDistPair = std::pair<unsigned int, unsigned short>;
+    // std::priority_queue<NodeDistPair, std::vector<NodeDistPair>, std::greater<>> pq;
+    std::priority_queue<NodeDistPair, std::vector<NodeDistPair>, std::greater<NodeDistPair>> pq;
 
-    while (!unvisited.empty()) {
-        // 找到未访问节点中距离最小的节点
-        unsigned short min_node = INFINITY_COST;
-        unsigned int min_dist = UINT_MAX;
 
-        for (auto node : unvisited) {
-            if (dist[node] < min_dist) {
-                min_dist = dist[node];
-                min_node = node;
-            }
+    pq.push({0, router_id});
+
+    // Dijkstra's algorithm using priority queue
+    while (!pq.empty()) {
+        // auto [min_dist, min_node] = pq.top();
+        NodeDistPair top = pq.top();
+        unsigned int min_dist = top.first;
+        unsigned short min_node = top.second;
+        pq.pop();
+
+        if (min_dist > dist[min_node]) {
+            continue; // Skip outdated entries in the priority queue
         }
 
-        if (min_node == INFINITY_COST) {
-            // 剩余的节点不可达，退出循环
-            break;
-        }
-
-        unvisited.erase(min_node);
-
-        // 更新邻居节点的距离
         for (const auto& entry_pair : ls_database) {
             const LSEntry& ls_entry = entry_pair.second;
-            unsigned short neighbor = INFINITY_COST;
             unsigned int cost = ls_entry.cost;
+            unsigned short neighbor = INFINITY_COST;
 
-            // 跳过成本为 INFINITY_COST 的链路
-            if (cost == INFINITY_COST) {
-                continue;
-            }
+            if (cost == INFINITY_COST) continue;
 
             if (ls_entry.src == min_node) {
                 neighbor = ls_entry.dst;
@@ -950,36 +1056,30 @@ void RoutingProtocolImpl::compute_shortest_paths() {
                 continue;
             }
 
-            if (unvisited.find(neighbor) != unvisited.end()) {
-                unsigned int alt = dist[min_node] + cost;
-                if (alt < dist[neighbor]) {
-                    dist[neighbor] = alt;
-                    prev[neighbor] = min_node;
-                }
+            unsigned int alt = dist[min_node] + cost;
+            if (alt < dist[neighbor]) {
+                dist[neighbor] = alt;
+                prev[neighbor] = min_node;
+                pq.push({alt, neighbor});
             }
         }
     }
 
-    // 更新 LS 路由表
-    lsRoutingTable.clear(); // 清除旧的路由信息
+    // Construct the routing table (unchanged from original)
+    lsRoutingTable.clear();
 
     for (auto node : nodes) {
         if (node == router_id || dist[node] == UINT_MAX) {
-            continue; // 跳过自己和不可达的节点
+            continue; // Skip self and unreachable nodes
         }
 
-        // 通过前驱节点链找到下一跳
         unsigned short next_hop = node;
         while (prev[next_hop] != router_id && prev[next_hop] != INFINITY_COST) {
             next_hop = prev[next_hop];
         }
 
-        if (prev[next_hop] == INFINITY_COST) {
-            // 无法找到路径，跳过
-            continue;
-        }
+        if (prev[next_hop] == INFINITY_COST) continue;
 
-        // 找到与下一跳相连的端口
         unsigned short port = INFINITY_COST;
         for (unsigned short p = 0; p < num_ports; p++) {
             if (ports[p].neighbor_id == next_hop && ports[p].is_alive) {
@@ -988,12 +1088,8 @@ void RoutingProtocolImpl::compute_shortest_paths() {
             }
         }
 
-        if (port == INFINITY_COST) {
-            // 未找到有效的端口，跳过
-            continue;
-        }
+        if (port == INFINITY_COST) continue;
 
-        // 更新 LS 路由表
         LSRouteEntry route_entry;
         route_entry.next_hop = next_hop;
         route_entry.port = port;
@@ -1001,10 +1097,8 @@ void RoutingProtocolImpl::compute_shortest_paths() {
         lsRoutingTable[node] = route_entry;
     }
 
-    // 可选：打印更新后的 LS 路由表
-    // print_ls_routing_table();
+    // Optional: print_ls_routing_table();
 }
-
 
 
 
