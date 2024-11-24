@@ -242,6 +242,7 @@ void RoutingProtocolImpl::handle_pong(unsigned short port, void *packet, unsigne
 
         // 触发链路状态更新广播
         send_ls_update(true);
+        compute_shortest_paths();
         DEBUG_PRINT("Router %d: Triggered LS update due to change in link (%d -> %d)\n",
                     router_id, router_id, src_id);
     }
@@ -319,6 +320,7 @@ void RoutingProtocolImpl::check_neighbors() {
     else if (ls_changed && protocol_type == P_LS) {
             // LS 协议触发链路状态广播
             send_ls_update(true);
+            compute_shortest_paths();
     }
 }
 
@@ -370,7 +372,7 @@ void RoutingProtocolImpl::handle_alarm(void *data) {
             if (protocol_type == P_LS) {
                 DEBUG_PRINT("Router %d: Sending periodic LS update at time %u\n", 
                            router_id, sys->time());
-                // add neighbor SeqNum
+                // add neighbor SeqNum for valid entries
                 add_neighbor_SeqNum();
                 send_ls_update(false);
                 AlarmType *new_alarm = new AlarmType(ALARM_LS_UPDATE);
@@ -550,6 +552,8 @@ void RoutingProtocolImpl::send_dv_update(bool triggered) {
 
 // add neighbor SeqNum
 void RoutingProtocolImpl::add_neighbor_SeqNum() {
+    // get current time
+    unsigned int current_time = sys->time();
     // iterlate ls database
     for (auto it = ls_database.begin(); it != ls_database.end(); ) {
         LSEntry &lsa = it->second;
@@ -560,10 +564,12 @@ void RoutingProtocolImpl::add_neighbor_SeqNum() {
         }
 
         // if src or dst is router_id, increase seq_num
+        // only increase seq_num for valid entries (last_updated time - current time < 45s)
         if (lsa.src == router_id || lsa.dst == router_id) {
-            lsa.seq_num++;
+            if (current_time - lsa.last_updated < 45000) {
+                lsa.seq_num++;
+            }
         }
-
         it++;
     }
 
@@ -793,28 +799,28 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
         // Determine if we need to update the LS database
         auto link_key = std::make_pair(std::min(lsa_src, lsa_dst), std::max(lsa_src, lsa_dst));
         bool need_update = false;
-        bool cost_changed = false;  // 新增变量，标记成本是否发生变化
+        // bool cost_changed = false;  // 新增变量，标记成本是否发生变化
 
         auto it = ls_database.find(link_key);
         if (it == ls_database.end()) {
             // LSDB 中没有该 LSA，需要添加并可能重新计算最短路径
             need_update = true;
-            cost_changed = true;  // 新的 LSA，成本视为已变化
+            // cost_changed = true;  // 新的 LSA，成本视为已变化
         } else {
             LSEntry &existing_lsa = it->second;
 
             if (seq_num > existing_lsa.seq_num) {
                 // 收到更新的 LSA，比较成本
                 need_update = true;
-                if (lsa_cost != existing_lsa.cost) {
-                    cost_changed = true;  // 成本发生变化
-                } else {
-                    cost_changed = false; // 成本未变化
-                }
+                // if (lsa_cost != existing_lsa.cost) {
+                //     cost_changed = true;  // 成本发生变化
+                // } else {
+                //     cost_changed = false; // 成本未变化
+                // }
             } else if (seq_num == existing_lsa.seq_num && lsa_cost != existing_lsa.cost) {
                 // 序列号相同但成本不同，可能存在问题，但仍更新
                 need_update = true;
-                cost_changed = true;
+                // cost_changed = true;
             } else {
                 // 序列号不更高，或者成本未变化，不需要更新
                 need_update = false;
@@ -831,16 +837,17 @@ void RoutingProtocolImpl::handle_ls_packet(unsigned short port, void *packet, un
             ls_entry.cost = lsa_cost;
             ls_entry.seq_num = seq_num;
             ls_entry.last_updated = current_time;
-
-            if (cost_changed) {
-                updated = true;  // 成本发生变化，需要重新计算最短路径
-                DEBUG_PRINT("Router %d: Updated link state (%d -> %d) with cost %d and seq_num %u\n",
-                            router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
-            } else {
-                // 成本未变化，不需要重新计算最短路径
-                DEBUG_PRINT("Router %d: Received newer LSA (%d -> %d) with same cost %d and higher seq_num %u\n",
-                            router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
-            }
+            // need to update entire LSDB
+            updated = true;
+            // if (cost_changed) {
+            //     updated = true;  // 成本发生变化，需要重新计算最短路径
+            //     DEBUG_PRINT("Router %d: Updated link state (%d -> %d) with cost %d and seq_num %u\n",
+            //                 router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
+            // } else {
+            //     // 成本未变化，不需要重新计算最短路径
+            //     DEBUG_PRINT("Router %d: Received newer LSA (%d -> %d) with same cost %d and higher seq_num %u\n",
+            //                 router_id, lsa_src, lsa_dst, lsa_cost, seq_num);
+            // }
         }
 
         offset += 10; // Each LSA is 10 bytes
@@ -1034,7 +1041,9 @@ void RoutingProtocolImpl::check_ls() {
     bool updated = false;
 
     for (auto it = ls_database.begin(); it != ls_database.end();) {
-        if (current_time - it->second.last_updated > 45000) {
+        // if no update for 45 seconds or cost is INFINITY_COST, remove it
+        // if (current_time - it->second.last_updated > 45000) {
+        if (current_time - it->second.last_updated > 45000 || it->second.cost == INFINITY_COST) {
             DEBUG_PRINT("Router %d: Removing expired link state (%d -> %d)\n",
                         router_id, it->second.src, it->second.dst);
             it = ls_database.erase(it);
