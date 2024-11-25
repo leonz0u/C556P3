@@ -25,6 +25,41 @@ If you want to run the Simulator with Distance Vector Policy with simpletest2, y
 
 First, you should review README.md and follow the instructions to check the operation of our implementation.
 
+## Testing Documentation (test.txt)
+
+The test.txt file contains comprehensive documentation including:
+
+1. Test Case Analysis
+A comprehensive test case (test3_cycle.conf) demonstrates the robustness of our implementation:
+    
+    Network Structure:
+    
+    - 5-node cyclic topology with bidirectional links
+    - Mixed latency links (1ms and 10ms)
+    - Multiple path options between nodes
+    
+    Test Scenarios:
+    
+    - Multiple traffic bursts between various nodes
+    - Link failure handling
+    - Alternative path routing
+    - Network recovery testing
+2. Protocol Correctness Verification
+    
+    Distance Vector (DV) Protocol:
+    
+    - Detailed analysis of Node 3 -> Node 2 communication
+    - DV table examination showing optimal path selection
+    - Verification of poison reverse implementation
+    - Cost calculation accuracy demonstration
+    
+    Link State (LS) Protocol:
+    
+    - Complete routing table analysis for all nodes
+    - Path cost verification (Node 3 -> Node 2)
+    - Demonstration of shortest path selection
+    - Multiple path cost comparison
+
 Then, If you want to know about how we implement the routing policy through our code, you can check the following: 
 
 # In the RoutingProtocollmpl.h
