@@ -1,0 +1,136 @@
+Test Case: Cyclic Network Topology with Link Failures
+
+Network Description:
+- 5 nodes forming a cyclic topology with bidirectional links
+- Node connections form multiple possible paths between nodes
+- Mix of low latency (1ms) and medium latency (10ms) links
+- Two key low-latency links connected to Node 1 (to Node 2 and 3)
+
+Link Properties:
+- Low latency links (0.001s delay):
+  * Node 1 <-> Node 2
+  * Node 1 <-> Node 3
+- Medium latency links (0.010s delay):
+  * Node 3 <-> Node 4
+  * Node 3 <-> Node 2
+  * Node 4 <-> Node 5
+  * Node 5 <-> Node 2
+- All links have 0.0 probability of packet loss
+
+Test Events:
+1. Initial burst of traffic from Node 3 to Node 2 (365.00-365.80s)
+   - Tests routing through multiple available paths
+   
+2. Traffic flow from Node 5 to Node 3 (475.00-475.80s)
+   - Tests path selection across the network
+
+3. Traffic flow from Node 2 to Node 4 (585.00-585.80s)
+   - Tests routing just before link failures
+
+4. Link failures at 588.00s and 589.00s
+   - Links (1,2) and (3,2) fail in sequence
+   - Tests network's ability to reroute around failed links
+   - Forces traffic to take alternative paths
+
+5. Final traffic test after failures (2205.00-2206.40s)
+   - Attempts communication between Node 1 and 2
+   - Verifies routing behavior with failed direct link
+
+Purpose:
+Tests both DV and LS protocols' ability to:
+- Handle multiple routing paths
+- Adapt to link failures
+- Route around failed links
+- Process concurrent traffic flows
+- Maintain connectivity through alternative paths
+
+Simulation ends at 2500.00s
+
+
+
+Proof of DV Protocol Correctness
+Analysis of Data Packet Transmission: Node 3 -> Node 2 (t=365.00s)
+
+1. Router 3's DV Table Breakdown:
+D  NH  P     C   LU    (Destination, Next Hop, Port, Cost, Last Update)
+1  1   0     2   2     (To Node 1: via Port 0, Cost 2ms)
+2  1   0     4   3     (To Node 2: via Port 0, Cost 4ms)
+3  3   65535 0   0     (To itself: direct)
+
+2. Router 1's DV Table Breakdown:
+D  NH  P     C   LU    
+1  1   65535 0   0     (To itself: direct)
+2  2   0     2   2     (To Node 2: via Port 0, Cost 2ms)
+3  3   1     2   2     (To Node 3: via Port 1, Cost 2ms)
+
+Analysis of Routing Process:
+
+1. Route Selection at Router 3:
+   - Destination is Node 2
+   - Table shows Next Hop = 1 (Router 1)
+   - Uses Port 0 to reach Router 1
+   - Total expected cost = 4ms
+
+2. Route Selection at Router 1:
+   - When packet arrives from Router 3
+   - Destination is Node 2
+   - Table shows Next Hop = 2
+   - Uses Port 0 to reach Router 2
+   - Cost = 2ms
+
+3. Complete Path Analysis:
+   Source (Router 3) -> Router 1 -> Destination (Router 2)
+   - Total Cost: 4ms
+   - Path matches DV tables at each hop
+   - Demonstrates optimal route selection
+
+
+
+
+For LS, we could focus on the data packet sent on time=365 which from router 3 to 2.
+
+At time = 365, there exist 3 paths from router 3 to router 2:
+1. 3->2, cost is = 20
+2. 3->1->2, cost is = 2 + 2 = 4
+3. 3->4->5->2, cost is = 20 + 20 + 20 = 60
+
+So, the path with the minimum cost is 3->1->2, and the cost is 4.
+
+At time = 365, the routing table of all routers is as follows:
+
+Router 1 LS Routing Table:
+Destination	Next Hop	Port	Cost
+2		2		0	2
+3		3		1	2
+4		3		1	22
+5		2		0	22
+
+Router 2 LS Routing Table:
+Destination	Next Hop	Port	Cost
+1		1		0	2
+3		1		0	4
+4		1		0	24
+5		5		2	20
+
+Router 3 LS Routing Table:
+Destination	Next Hop	Port	Cost
+1		1		0	2
+2		1		0	4
+4		4		1	20
+5		1		0	24
+
+Router 4 LS Routing Table:
+Destination	Next Hop	Port	Cost
+1		3		0	22
+2		3		0	24
+3		3		0	20
+5		5		1	20
+
+Router 5 LS Routing Table:
+Destination	Next Hop	Port	Cost
+1		2		1	22
+2		2		1	20
+3		2		1	24
+4		4		0	20
+
+In the routing table of router 3, we can see that the cost from router 3 to router 2 is 4, So, the data packet is sent on the correct path.

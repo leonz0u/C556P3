@@ -4,7 +4,7 @@
 #include <limits.h>
 #include <set>
 
-#define DEBUG 0
+#define DEBUG 1
 #define DEBUG_PRINT(fmt, ...) \
     do { if (DEBUG) fprintf(stderr, fmt, ##__VA_ARGS__); } while (0)
 
@@ -805,7 +805,7 @@ void RoutingProtocolImpl::compute_shortest_paths() {
         lsRoutingTable[node] = route_entry;
     }
 
-    // Optional: print_ls_routing_table();
+    print_ls_routing_table();
 }
 
 
